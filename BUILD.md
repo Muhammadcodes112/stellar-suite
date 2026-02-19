@@ -23,6 +23,12 @@ This compiles TypeScript files from `src/` to `out/`.
 
 ### 3. Run in VS Code Extension Development Host
 
+Optional parser tests:
+
+```bash
+npm test
+```
+
 **Option A: Using VS Code UI**
 1. Open this folder in VS Code
 2. Press `F5` (or go to Run > Start Debugging)

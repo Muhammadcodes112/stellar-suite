@@ -3,6 +3,14 @@ import { promisify } from 'util';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import {
+    CliErrorContext,
+    CliErrorType,
+    formatCliErrorForDisplay,
+    formatCliErrorForNotification,
+    logCliError,
+    parseCliErrorOutput,
+} from '../utils/cliErrorParser';
 
 const execFileAsync = promisify(execFile);
 
@@ -31,8 +39,25 @@ export interface DeploymentResult {
     contractId?: string;
     transactionHash?: string;
     error?: string;
+    errorSummary?: string;
+    errorType?: CliErrorType;
+    errorCode?: string;
+    errorSuggestions?: string[];
+    errorContext?: CliErrorContext;
+    rawError?: string;
     buildOutput?: string;
     deployOutput?: string;
+}
+
+interface BuildResult {
+    success: boolean;
+    output: string;
+    wasmPath?: string;
+    errorSummary?: string;
+    errorType?: CliErrorType;
+    errorCode?: string;
+    errorSuggestions?: string[];
+    rawError?: string;
 }
 
 export class ContractDeployer {
@@ -46,7 +71,7 @@ export class ContractDeployer {
         this.network = network;
     }
 
-    async buildContract(contractPath: string): Promise<{ success: boolean; output: string; wasmPath?: string }> {
+    async buildContract(contractPath: string): Promise<BuildResult> {
         try {
             const env = getEnvironmentWithPath();
             
@@ -92,9 +117,23 @@ export class ContractDeployer {
             };
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+            const stderrText = this.getExecErrorStream(error, 'stderr');
+            const stdoutText = this.getExecErrorStream(error, 'stdout');
+            const rawOutput = [stderrText, stdoutText, errorMessage].filter(Boolean).join('\n');
+            const parsedError = parseCliErrorOutput(rawOutput || errorMessage, {
+                command: 'stellar contract build',
+                network: this.network,
+            });
+            logCliError(parsedError, '[Build CLI]');
+
             return {
                 success: false,
-                output: errorMessage
+                output: formatCliErrorForDisplay(parsedError),
+                errorSummary: formatCliErrorForNotification(parsedError),
+                errorType: parsedError.type,
+                errorCode: parsedError.code,
+                errorSuggestions: parsedError.suggestions,
+                rawError: parsedError.normalized,
             };
         }
     }
@@ -111,7 +150,10 @@ export class ContractDeployer {
             if (!fs.existsSync(wasmPath)) {
                 return {
                     success: false,
-                    error: `WASM file not found: ${wasmPath}`
+                    error: `WASM file not found: ${wasmPath}`,
+                    errorSummary: 'Validation error: WASM file path does not exist.',
+                    errorType: 'validation',
+                    errorSuggestions: ['Rebuild the contract and select an existing WASM file.'],
                 };
             }
 
@@ -162,6 +204,12 @@ export class ContractDeployer {
                 return {
                     success: false,
                     error: 'Could not extract Contract ID from deployment output',
+                    errorSummary: 'Execution error: Deployment completed but Contract ID was missing in output.',
+                    errorType: 'execution',
+                    errorSuggestions: [
+                        'Inspect deployment output and retry with a single target network/source.',
+                        'Run deployment manually in terminal to compare CLI behavior.',
+                    ],
                     deployOutput: output
                 };
             }
@@ -174,16 +222,33 @@ export class ContractDeployer {
             };
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-            
-            // Try to extract error details from stderr if available
-            let errorOutput = errorMessage;
-            if (error instanceof Error && 'stderr' in error) {
-                errorOutput = (error as any).stderr || errorMessage;
+            const stderrText = this.getExecErrorStream(error, 'stderr');
+            const stdoutText = this.getExecErrorStream(error, 'stdout');
+            const rawOutput = [stderrText, stdoutText, errorMessage].filter(Boolean).join('\n');
+            const parsedError = parseCliErrorOutput(rawOutput || errorMessage, {
+                command: 'stellar contract deploy',
+                network: this.network,
+            });
+
+            if (errorMessage.includes('ENOENT') || errorMessage.includes('not found')) {
+                parsedError.message = `Stellar CLI not found at "${this.cliPath}".`;
+                parsedError.suggestions = [
+                    'Install Stellar CLI, or set `stellarSuite.cliPath` to a valid binary path.',
+                    ...parsedError.suggestions,
+                ];
             }
+
+            logCliError(parsedError, '[Deploy CLI]');
 
             return {
                 success: false,
-                error: errorOutput
+                error: formatCliErrorForDisplay(parsedError),
+                errorSummary: formatCliErrorForNotification(parsedError),
+                errorType: parsedError.type,
+                errorCode: parsedError.code,
+                errorSuggestions: parsedError.suggestions,
+                errorContext: parsedError.context,
+                rawError: parsedError.normalized,
             };
         }
     }
@@ -202,6 +267,11 @@ export class ContractDeployer {
             return {
                 success: false,
                 error: `Build failed: ${buildResult.output}`,
+                errorSummary: buildResult.errorSummary,
+                errorType: buildResult.errorType,
+                errorCode: buildResult.errorCode,
+                errorSuggestions: buildResult.errorSuggestions,
+                rawError: buildResult.rawError,
                 buildOutput: buildResult.output
             };
         }
@@ -229,5 +299,13 @@ export class ContractDeployer {
      */
     async deployFromWasm(wasmPath: string): Promise<DeploymentResult> {
         return this.deployContract(wasmPath);
+    }
+
+    private getExecErrorStream(error: unknown, stream: 'stderr' | 'stdout'): string {
+        if (typeof error !== 'object' || error === null) {
+            return '';
+        }
+        const value = (error as Record<string, unknown>)[stream];
+        return typeof value === 'string' ? value : '';
     }
 }
