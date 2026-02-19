@@ -5,12 +5,17 @@
 
 import * as vscode from 'vscode';
 import { simulateTransaction } from './commands/simulateTransaction';
-import { deployContract }      from './commands/deployContract';
-import { buildContract }       from './commands/buildContract';
+import { deployContract } from './commands/deployContract';
+import { buildContract } from './commands/buildContract';
 import { manageCliConfiguration } from './commands/manageCliConfiguration';
+import { registerSyncCommands } from './commands/syncCommands';
 import { SidebarViewProvider } from './ui/sidebarView';
+import { WorkspaceStateSyncService } from './services/workspaceStateSyncService';
+import { SyncStatusProvider } from './ui/syncStatusProvider';
 
 let sidebarProvider: SidebarViewProvider | undefined;
+let syncService: WorkspaceStateSyncService | undefined;
+let syncStatusProvider: SyncStatusProvider | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
     const outputChannel = vscode.window.createOutputChannel('Stellar Suite');
@@ -18,6 +23,11 @@ export function activate(context: vscode.ExtensionContext) {
     console.log('[Stellar Suite] Extension activating...');
 
     try {
+        // Initialize workspace state synchronization
+        syncService = new WorkspaceStateSyncService(context);
+        syncStatusProvider = new SyncStatusProvider(syncService);
+        outputChannel.appendLine('[Extension] Workspace state sync service initialized');
+
         // ── Sidebar ───────────────────────────────────────────
         sidebarProvider = new SidebarViewProvider(context.extensionUri, context);
         context.subscriptions.push(
@@ -78,7 +88,6 @@ export function activate(context: vscode.ExtensionContext) {
         const copyContractIdCommand = vscode.commands.registerCommand(
             'stellarSuite.copyContractId',
             async () => {
-                // Prompt for contract ID if invoked from palette (no webview context)
                 const id = await vscode.window.showInputBox({
                     title: 'Copy Contract ID',
                     prompt: 'Enter the contract ID to copy to clipboard',
@@ -90,6 +99,12 @@ export function activate(context: vscode.ExtensionContext) {
             }
         );
 
+        // Register sync commands
+        if (syncService) {
+            registerSyncCommands(context, syncService);
+            outputChannel.appendLine('[Extension] Workspace sync commands registered');
+        }
+
         outputChannel.appendLine('[Extension] All commands registered');
 
         // ── File watcher ──────────────────────────────────────
@@ -98,26 +113,6 @@ export function activate(context: vscode.ExtensionContext) {
         watcher.onDidChange(refreshOnChange);
         watcher.onDidCreate(refreshOnChange);
         watcher.onDidDelete(refreshOnChange);
-
-        // ── Example: registering a custom context action ──────
-        // This demonstrates the extensibility API. Other extensions
-        // or future features can add their own sidebar context actions.
-        //
-        // const customActionDisposable = registerCustomContextAction({
-        //     action: {
-        //         id: 'myCustomAction',
-        //         label: 'Run Custom Script',
-        //         icon: 'terminal',
-        //         enabled: true,
-        //         separatorBefore: true,
-        //     },
-        //     insertBefore: 'delete',
-        //     handler: async (contract, ctx) => {
-        //         vscode.window.showInformationMessage(`Custom action on ${contract.name}`);
-        //         return { type: 'success', message: 'Custom action complete.' };
-        //     },
-        // });
-        // context.subscriptions.push(customActionDisposable);
 
         context.subscriptions.push(
             simulateCommand,
@@ -128,7 +123,8 @@ export function activate(context: vscode.ExtensionContext) {
             deployFromSidebarCommand,
             simulateFromSidebarCommand,
             copyContractIdCommand,
-            watcher
+            watcher,
+            syncStatusProvider || { dispose: () => {} }
         );
 
         outputChannel.appendLine('[Extension] Extension activation complete');
@@ -145,4 +141,6 @@ export function activate(context: vscode.ExtensionContext) {
     }
 }
 
-export function deactivate() {}
+export function deactivate() {
+    syncStatusProvider?.dispose();
+}
