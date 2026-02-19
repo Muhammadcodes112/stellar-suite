@@ -254,7 +254,10 @@ export async function simulateTransaction(context: vscode.ExtensionContext, side
                 if (result.success) {
                     vscode.window.showInformationMessage('Simulation completed successfully');
                 } else {
-                    vscode.window.showErrorMessage(`Simulation failed: ${result.error}`);
+                    const notificationMessage = result.errorSummary
+                        ? `Simulation failed: ${result.errorSummary}`
+                        : `Simulation failed: ${result.error}`;
+                    vscode.window.showErrorMessage(notificationMessage);
                 }
             }
         );

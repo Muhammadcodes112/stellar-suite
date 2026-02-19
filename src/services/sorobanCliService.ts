@@ -1,6 +1,14 @@
 import { execFile, exec } from 'child_process';
 import { promisify } from 'util';
-import { formatCliError } from '../utils/errorFormatter';
+import {
+    CliErrorContext,
+    CliErrorType,
+    formatCliErrorForDisplay,
+    formatCliErrorForNotification,
+    logCliError,
+    looksLikeCliError,
+    parseCliErrorOutput,
+} from '../utils/cliErrorParser';
 import * as os from 'os';
 import * as path from 'path';
 
@@ -31,6 +39,12 @@ export interface SimulationResult {
     success: boolean;
     result?: any;
     error?: string;
+    errorSummary?: string;
+    errorType?: CliErrorType;
+    errorCode?: string;
+    errorSuggestions?: string[];
+    errorContext?: CliErrorContext;
+    rawError?: string;
     resourceUsage?: {
         cpuInstructions?: number;
         memoryBytes?: number;
@@ -105,11 +119,15 @@ export class SorobanCliService {
 
             if (stderr && stderr.trim().length > 0) {
                 // CLI may output warnings to stderr, but if it looks like an error, treat it as such
-                if (stderr.toLowerCase().includes('error') || stderr.toLowerCase().includes('failed')) {
-                    return {
-                        success: false,
-                        error: formatCliError(stderr)
-                    };
+                if (looksLikeCliError(stderr)) {
+                    const parsedError = parseCliErrorOutput(stderr, {
+                        command: 'stellar contract invoke',
+                        contractId,
+                        functionName,
+                        network,
+                    });
+                    logCliError(parsedError, '[Simulation CLI]');
+                    return this.toSimulationError(parsedError);
                 }
             }
 
@@ -159,20 +177,51 @@ export class SorobanCliService {
             }
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-            
-            // Check if it's a "command not found" error
+            const cliContext: CliErrorContext = {
+                command: 'stellar contract invoke',
+                contractId,
+                functionName,
+                network,
+            };
+
+            const stderrText = this.getExecErrorStream(error, 'stderr');
+            const stdoutText = this.getExecErrorStream(error, 'stdout');
+            const combined = [stderrText, stdoutText, errorMessage].filter(Boolean).join('\n');
+
+            const parsedError = parseCliErrorOutput(combined || errorMessage, cliContext);
+
             if (errorMessage.includes('ENOENT') || errorMessage.includes('not found')) {
-                return {
-                    success: false,
-                    error: `Stellar CLI not found at "${this.cliPath}". Make sure it is installed and in your PATH, or configure the stellarSuite.cliPath setting.`
-                };
+                parsedError.message = `Stellar CLI not found at "${this.cliPath}".`;
+                parsedError.suggestions = [
+                    'Install Stellar CLI, or update `stellarSuite.cliPath` to a valid executable.',
+                    ...parsedError.suggestions,
+                ];
             }
 
-            return {
-                success: false,
-                error: `CLI execution failed: ${errorMessage}`
-            };
+            logCliError(parsedError, '[Simulation CLI]');
+            return this.toSimulationError(parsedError);
         }
+    }
+
+    private getExecErrorStream(error: unknown, stream: 'stderr' | 'stdout'): string {
+        if (typeof error !== 'object' || error === null) {
+            return '';
+        }
+        const value = (error as Record<string, unknown>)[stream];
+        return typeof value === 'string' ? value : '';
+    }
+
+    private toSimulationError(parsedError: ReturnType<typeof parseCliErrorOutput>): SimulationResult {
+        return {
+            success: false,
+            error: formatCliErrorForDisplay(parsedError),
+            errorSummary: formatCliErrorForNotification(parsedError),
+            errorType: parsedError.type,
+            errorCode: parsedError.code,
+            errorSuggestions: parsedError.suggestions,
+            errorContext: parsedError.context,
+            rawError: parsedError.normalized,
+        };
     }
 
     /**

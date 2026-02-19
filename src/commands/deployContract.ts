@@ -303,13 +303,28 @@ export async function deployContract(context: vscode.ExtensionContext, sidebarPr
                 } else {
                     outputChannel.appendLine(`❌ Deployment failed!`);
                     outputChannel.appendLine(`Error: ${result.error || 'Unknown error'}`);
+                    if (result.errorCode) {
+                        outputChannel.appendLine(`Error Code: ${result.errorCode}`);
+                    }
+                    if (result.errorType) {
+                        outputChannel.appendLine(`Error Type: ${result.errorType}`);
+                    }
+                    if (result.errorSuggestions && result.errorSuggestions.length > 0) {
+                        outputChannel.appendLine('Suggestions:');
+                        for (const suggestion of result.errorSuggestions) {
+                            outputChannel.appendLine(`- ${suggestion}`);
+                        }
+                    }
                     
                     if (result.deployOutput) {
                         outputChannel.appendLine('\n=== Deployment Output ===');
                         outputChannel.appendLine(result.deployOutput);
                     }
 
-                    vscode.window.showErrorMessage(`Deployment failed: ${result.error}`);
+                    const notificationMessage = result.errorSummary
+                        ? `Deployment failed: ${result.errorSummary}`
+                        : `Deployment failed: ${result.error}`;
+                    vscode.window.showErrorMessage(notificationMessage);
                 }
 
                 progress.report({ increment: 100, message: 'Complete' });

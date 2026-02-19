@@ -5,18 +5,11 @@
 
 import * as vscode from 'vscode';
 import { simulateTransaction } from './commands/simulateTransaction';
-<<<<<<< HEAD
-import { deployContract }      from './commands/deployContract';
-import { buildContract }       from './commands/buildContract';
-import { SidebarViewProvider } from './ui/sidebarView';
-import { registerCustomContextAction } from './services/contextMenuService';
-=======
 import { deployContract } from './commands/deployContract';
 import { buildContract } from './commands/buildContract';
 import { registerGroupCommands } from './commands/groupCommands';
 import { SidebarViewProvider } from './ui/sidebarView';
 import { ContractGroupService } from './services/contractGroupService';
->>>>>>> ec49c33444a89acc1dfb0e54c6da989d01b44871
 
 let sidebarProvider: SidebarViewProvider | undefined;
 let groupService: ContractGroupService | undefined;
@@ -27,10 +20,6 @@ export function activate(context: vscode.ExtensionContext) {
     console.log('[Stellar Suite] Extension activating...');
 
     try {
-<<<<<<< HEAD
-        // ── Sidebar ───────────────────────────────────────────
-        sidebarProvider = new SidebarViewProvider(context.extensionUri, context);
-=======
         // Initialize contract group service
         groupService = new ContractGroupService(context);
         groupService.loadGroups().then(() => {
@@ -41,8 +30,8 @@ export function activate(context: vscode.ExtensionContext) {
         registerGroupCommands(context, groupService);
         outputChannel.appendLine('[Extension] Group commands registered');
 
-        sidebarProvider = new SidebarViewProvider(context.extensionUri, context, groupService);
->>>>>>> ec49c33444a89acc1dfb0e54c6da989d01b44871
+        // ── Sidebar ───────────────────────────────────────────
+        sidebarProvider = new SidebarViewProvider(context.extensionUri, context);
         context.subscriptions.push(
             vscode.window.registerWebviewViewProvider(
                 SidebarViewProvider.viewType,

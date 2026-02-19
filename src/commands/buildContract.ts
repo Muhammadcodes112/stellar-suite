@@ -102,7 +102,23 @@ export async function buildContract(context: vscode.ExtensionContext, sidebarPro
                 } else {
                     outputChannel.appendLine(`❌ Build failed!`);
                     outputChannel.appendLine(`Error: ${buildResult.output}`);
-                    vscode.window.showErrorMessage(`Build failed: ${buildResult.output}`);
+                    if (buildResult.errorCode) {
+                        outputChannel.appendLine(`Error Code: ${buildResult.errorCode}`);
+                    }
+                    if (buildResult.errorType) {
+                        outputChannel.appendLine(`Error Type: ${buildResult.errorType}`);
+                    }
+                    if (buildResult.errorSuggestions && buildResult.errorSuggestions.length > 0) {
+                        outputChannel.appendLine('Suggestions:');
+                        for (const suggestion of buildResult.errorSuggestions) {
+                            outputChannel.appendLine(`- ${suggestion}`);
+                        }
+                    }
+
+                    const notificationMessage = buildResult.errorSummary
+                        ? `Build failed: ${buildResult.errorSummary}`
+                        : `Build failed: ${buildResult.output}`;
+                    vscode.window.showErrorMessage(notificationMessage);
                 }
 
                 progress.report({ increment: 100, message: 'Complete' });

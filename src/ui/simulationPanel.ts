@@ -154,6 +154,29 @@ export class SimulationPanel {
             `
             : '';
 
+        const errorMetadataHtml = !result.success
+            ? `
+            <div class="error-meta">
+                <table>
+                    ${result.errorType ? `<tr><td>Error Type:</td><td>${escapeHtml(result.errorType)}</td></tr>` : ''}
+                    ${result.errorCode ? `<tr><td>Error Code:</td><td>${escapeHtml(result.errorCode)}</td></tr>` : ''}
+                    ${result.errorContext?.network ? `<tr><td>Network:</td><td>${escapeHtml(result.errorContext.network)}</td></tr>` : ''}
+                    ${result.errorContext?.contractId ? `<tr><td>Contract:</td><td><code>${escapeHtml(result.errorContext.contractId)}</code></td></tr>` : ''}
+                    ${result.errorContext?.functionName ? `<tr><td>Function:</td><td><code>${escapeHtml(result.errorContext.functionName)}</code></td></tr>` : ''}
+                </table>
+            </div>
+            `
+            : '';
+
+        const suggestionsHtml = !result.success && result.errorSuggestions && result.errorSuggestions.length > 0
+            ? `
+            <h3>Suggested Resolution</h3>
+            <ul class="error-suggestions">
+                ${result.errorSuggestions.map(suggestion => `<li>${escapeHtml(suggestion)}</li>`).join('')}
+            </ul>
+            `
+            : '';
+
         return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -219,6 +242,25 @@ export class SimulationPanel {
             padding: 12px;
             border-radius: 4px;
             border-left: 4px solid var(--vscode-inputValidation-errorBorder);
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+        }
+        .error-meta {
+            margin-top: 12px;
+            padding: 12px;
+            border-radius: 4px;
+            border: 1px solid var(--vscode-panel-border);
+            background-color: var(--vscode-textCodeBlock-background);
+        }
+        .error-meta table td:first-child {
+            width: 140px;
+        }
+        .error-suggestions {
+            margin-top: 12px;
+            padding-left: 20px;
+        }
+        .error-suggestions li {
+            margin-bottom: 6px;
         }
         .result-value {
             background-color: var(--vscode-textCodeBlock-background);
@@ -258,6 +300,8 @@ export class SimulationPanel {
             <div class="error-message">
                 ${escapeHtml(result.error || 'Unknown error occurred')}
             </div>
+            ${errorMetadataHtml}
+            ${suggestionsHtml}
         </div>
         `
     }
