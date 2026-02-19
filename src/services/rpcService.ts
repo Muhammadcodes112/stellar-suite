@@ -1,10 +1,16 @@
 import { formatError } from '../utils/errorFormatter';
-import { RpcLogger } from './rpcLogger';
+import { CliErrorContext, CliErrorType } from '../utils/cliErrorParser';
 
 export interface SimulationResult {
     success: boolean;
     result?: any;
     error?: string;
+    errorSummary?: string;
+    errorType?: CliErrorType;
+    errorCode?: string;
+    errorSuggestions?: string[];
+    errorContext?: CliErrorContext;
+    rawError?: string;
     resourceUsage?: {
         cpuInstructions?: number;
         memoryBytes?: number;

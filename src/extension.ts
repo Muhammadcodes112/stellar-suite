@@ -5,10 +5,6 @@
 
 import * as vscode from 'vscode';
 import { simulateTransaction } from './commands/simulateTransaction';
-import { deployContract }      from './commands/deployContract';
-import { buildContract }       from './commands/buildContract';
-import { SidebarViewProvider } from './ui/sidebarView';
-import { registerCustomContextAction } from './services/contextMenuService';
 import { deployContract } from './commands/deployContract';
 import { buildContract } from './commands/buildContract';
 import { registerRpcLoggingCommands } from './commands/rpcLoggingCommands';
@@ -30,24 +26,6 @@ export function activate(context: vscode.ExtensionContext) {
     console.log('[Stellar Suite] Extension activating...');
 
     try {
-        // Initialize RPC Logger
-        rpcLogger = new RpcLogger({
-            level: require('vscode').workspace.getConfiguration('stellarSuite').get('rpcLogLevel') || 'INFO',
-            maskSensitiveData: true,
-            enableConsoleOutput: true,
-            context,
-        });
-
-        rpcLogger.loadLogs().then(() => {
-            outputChannel.appendLine('[Extension] RPC Logger initialized and logs loaded');
-        });
-
-        // Register RPC logging commands
-        registerRpcLoggingCommands(context, rpcLogger);
-        outputChannel.appendLine('[Extension] RPC logging commands registered');
-
-        // ── Sidebar ───────────────────────────────────────────
-        sidebarProvider = new SidebarViewProvider(context.extensionUri, context);
         // Initialize contract group service
         groupService = new ContractGroupService(context);
         groupService.loadGroups().then(() => {
@@ -58,7 +36,8 @@ export function activate(context: vscode.ExtensionContext) {
         registerGroupCommands(context, groupService);
         outputChannel.appendLine('[Extension] Group commands registered');
 
-        sidebarProvider = new SidebarViewProvider(context.extensionUri, context, groupService);
+        // ── Sidebar ───────────────────────────────────────────
+        sidebarProvider = new SidebarViewProvider(context.extensionUri, context);
         context.subscriptions.push(
             vscode.window.registerWebviewViewProvider(
                 SidebarViewProvider.viewType,
