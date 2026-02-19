@@ -480,7 +480,7 @@ async function testServiceHandlesMissingFile() {
         assert.fail('should have thrown an error for missing file');
     } catch (err) {
         assert.ok(err instanceof Error, 'should throw an Error');
-        assert.ok(err.message.includes('Cannot read'), 'error message should mention read failure');
+        assert.ok((err as Error).message.includes('Cannot read'), 'error message should mention read failure');
     }
     console.log('  [ok] ContractMetadataService throws when file cannot be read');
 }
