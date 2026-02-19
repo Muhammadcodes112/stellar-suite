@@ -23,6 +23,12 @@ This compiles TypeScript files from `src/` to `out/`.
 
 ### 3. Run in VS Code Extension Development Host
 
+Optional parser tests:
+
+```bash
+npm test
+```
+
 **Option A: Using VS Code UI**
 1. Open this folder in VS Code
 2. Press `F5` (or go to Run > Start Debugging)
@@ -32,6 +38,7 @@ This compiles TypeScript files from `src/` to `out/`.
      - "Stellar Suite: Build Contract"
      - "Stellar Suite: Deploy Contract"
      - "Stellar Suite: Simulate Soroban Transaction"
+     - "Stellar Suite: Configure CLI"
    - Or use the Stellar Suite sidebar (icon in the Activity Bar)
 
 **Option B: Using Launch Configuration**

@@ -1,9 +1,16 @@
 import { formatError } from '../utils/errorFormatter';
+import { CliErrorContext, CliErrorType } from '../utils/cliErrorParser';
 
 export interface SimulationResult {
     success: boolean;
     result?: any;
     error?: string;
+    errorSummary?: string;
+    errorType?: CliErrorType;
+    errorCode?: string;
+    errorSuggestions?: string[];
+    errorContext?: CliErrorContext;
+    rawError?: string;
     resourceUsage?: {
         cpuInstructions?: number;
         memoryBytes?: number;
@@ -15,10 +22,19 @@ export interface SimulationResult {
  */
 export class RpcService {
     private rpcUrl: string;
+    private logger?: any;
 
-    constructor(rpcUrl: string) {
+    constructor(rpcUrl: string, logger?: any) {
         // Ensure URL ends with / for proper path joining
         this.rpcUrl = rpcUrl.endsWith('/') ? rpcUrl.slice(0, -1) : rpcUrl;
+        this.logger = logger;
+    }
+
+    /**
+     * Get the logger instance if available
+     */
+    public getLogger(): any {
+        return this.logger;
     }
 
     /**
@@ -34,9 +50,12 @@ export class RpcService {
         functionName: string,
         args: any[]
     ): Promise<SimulationResult> {
+        const method = 'simulateTransaction';
+        const url = `${this.rpcUrl}/rpc`;
+        let requestId: string | undefined;
+
         try {
             // Build the RPC request
-            // Using the simulateTransaction RPC method
             const requestBody = {
                 jsonrpc: '2.0',
                 id: 1,
@@ -46,16 +65,17 @@ export class RpcService {
                         contractId,
                         functionName,
                         args: args.map(arg => ({
-                            // Convert arguments to Soroban SCVal format
-                            // For MVP, we'll send as JSON and let RPC handle conversion
                             value: arg
                         }))
                     }
                 }
             };
 
+            // Log the request if logger available
+            const requestId = this.logger?.logRequest?.(method, url, requestBody);
+
             // Make the RPC call
-            const response = await fetch(`${this.rpcUrl}/rpc`, {
+            const response = await fetch(url, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -65,19 +85,26 @@ export class RpcService {
             });
 
             if (!response.ok) {
+                const errorMessage = `RPC request failed with status ${response.status}: ${response.statusText}`;
+                this.logger?.logError?.(requestId, method, errorMessage);
                 return {
                     success: false,
-                    error: `RPC request failed with status ${response.status}: ${response.statusText}`
+                    error: errorMessage
                 };
             }
 
             const data: any = await response.json();
 
+            // Log the response if logger available
+            this.logger?.logResponse?.(requestId, method, response.status, data);
+
             // Handle RPC error response
             if (data.error) {
+                const errorMessage = data.error.message || 'RPC error occurred';
+                this.logger?.logError?.(requestId, method, errorMessage);
                 return {
                     success: false,
-                    error: data.error.message || 'RPC error occurred'
+                    error: errorMessage
                 };
             }
 
@@ -90,8 +117,13 @@ export class RpcService {
                 resourceUsage: result.resourceUsage || result.resource_usage
             };
         } catch (error) {
-            const formatted = formatError(error, 'RPC');
-            
+            const errorMessage = this.formatErrorMessage(error);
+
+            // Log the error if logger available
+            if (requestId) {
+                this.logger?.logError?.(requestId, method, error instanceof Error ? error.message : String(error));
+            }
+
             // Handle network errors
             if (error instanceof TypeError && error.message.includes('fetch')) {
                 return {
@@ -107,6 +139,7 @@ export class RpcService {
                 };
             }
 
+            const formatted = formatError(error, 'RPC');
             return {
                 success: false,
                 error: formatted.message
@@ -120,11 +153,16 @@ export class RpcService {
      * @returns True if endpoint is accessible
      */
     async isAvailable(): Promise<boolean> {
+        const method = 'health-check';
+        const requestId = this.logger?.logRequest?.(method, `${this.rpcUrl}/health`, {});
+
         try {
             const response = await fetch(`${this.rpcUrl}/health`, {
                 method: 'GET',
                 signal: AbortSignal.timeout(5000)
             });
+
+            this.logger?.logResponse?.(requestId, method, response.status, { available: response.ok });
             return response.ok;
         } catch {
             // If health endpoint doesn't exist, try a simple RPC call
@@ -135,10 +173,43 @@ export class RpcService {
                     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getHealth' }),
                     signal: AbortSignal.timeout(5000)
                 });
+
+                this.logger?.logResponse?.(requestId, method, response.status, { available: response.ok });
                 return response.ok;
-            } catch {
+            } catch (error) {
+                this.logger?.logError?.(requestId, method, error instanceof Error ? error.message : String(error));
                 return false;
             }
         }
+    }
+
+    /**
+     * Set a custom logger instance
+     */
+    public setLogger(logger: any): void {
+        this.logger = logger;
+    }
+
+    /**
+     * Get RPC timing statistics
+     */
+    public getTimingStats() {
+        return this.logger?.getTimingStats?.();
+    }
+
+    /**
+     * Get RPC error statistics
+     */
+    public getErrorStats() {
+        return this.logger?.getErrorStats?.();
+    }
+
+    // Private helper methods
+
+    private formatErrorMessage(error: any): string {
+        if (error instanceof Error) {
+            return error.message;
+        }
+        return String(error);
     }
 }
