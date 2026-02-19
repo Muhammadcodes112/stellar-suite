@@ -7,6 +7,14 @@ import * as vscode from 'vscode';
 import { simulateTransaction } from './commands/simulateTransaction';
 import { deployContract } from './commands/deployContract';
 import { buildContract } from './commands/buildContract';
+import { registerGroupCommands } from './commands/groupCommands';
+import { SidebarViewProvider } from './ui/sidebarView';
+import { ContractGroupService } from './services/contractGroupService';
+import { ContractVersionTracker } from './services/contractVersionTracker';
+
+let sidebarProvider: SidebarViewProvider | undefined;
+let groupService: ContractGroupService | undefined;
+let versionTracker: ContractVersionTracker | undefined;
 import { manageCliConfiguration } from './commands/manageCliConfiguration';
 import { registerSyncCommands } from './commands/syncCommands';
 import { SidebarViewProvider } from './ui/sidebarView';
@@ -23,6 +31,19 @@ export function activate(context: vscode.ExtensionContext) {
     console.log('[Stellar Suite] Extension activating...');
 
     try {
+        // Initialize contract group service
+        groupService = new ContractGroupService(context);
+        groupService.loadGroups().then(() => {
+            outputChannel.appendLine('[Extension] Contract group service initialized');
+        });
+
+        // Register group commands
+        registerGroupCommands(context, groupService);
+        outputChannel.appendLine('[Extension] Group commands registered');
+
+        // Initialize version tracker
+        versionTracker = new ContractVersionTracker(context, outputChannel);
+        outputChannel.appendLine('[Extension] Contract version tracker initialized');
         // Initialize workspace state synchronization
         syncService = new WorkspaceStateSyncService(context);
         syncStatusProvider = new SyncStatusProvider(syncService);
@@ -99,6 +120,19 @@ export function activate(context: vscode.ExtensionContext) {
             }
         );
 
+        // ── Version tracking commands ─────────────────────────
+        const showVersionMismatchesCommand = vscode.commands.registerCommand(
+            'stellarSuite.showVersionMismatches',
+            async () => {
+                if (!versionTracker) { return; }
+                const mismatches = versionTracker.getMismatches();
+                if (!mismatches.length) {
+                    vscode.window.showInformationMessage('Stellar Suite: No version mismatches detected.');
+                    return;
+                }
+                await versionTracker.notifyMismatches();
+            }
+        );
         // Register sync commands
         if (syncService) {
             registerSyncCommands(context, syncService);
@@ -123,6 +157,8 @@ export function activate(context: vscode.ExtensionContext) {
             deployFromSidebarCommand,
             simulateFromSidebarCommand,
             copyContractIdCommand,
+            showVersionMismatchesCommand,
+            watcher
             watcher,
             syncStatusProvider || { dispose: () => {} }
         );
