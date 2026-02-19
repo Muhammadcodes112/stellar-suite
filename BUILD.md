@@ -32,6 +32,7 @@ This compiles TypeScript files from `src/` to `out/`.
      - "Stellar Suite: Build Contract"
      - "Stellar Suite: Deploy Contract"
      - "Stellar Suite: Simulate Soroban Transaction"
+     - "Stellar Suite: Configure CLI"
    - Or use the Stellar Suite sidebar (icon in the Activity Bar)
 
 **Option B: Using Launch Configuration**
