@@ -37,7 +37,6 @@ function getEnvironmentWithPath(customEnv?: Record<string, string>): NodeJS.Proc
     if (customEnv) {
         Object.assign(env, customEnv);
     }
-
     return env;
 }
 
@@ -243,7 +242,7 @@ export class SorobanCliService {
     /**
      * Check if Stellar CLI is available.
      * Uses the official CLI version command.
-     * 
+     *
      * @returns True if CLI is accessible
      */
     async isAvailable(): Promise<boolean> {
@@ -258,7 +257,7 @@ export class SorobanCliService {
 
     /**
      * Try to find Stellar CLI in common installation locations.
-     * 
+     *
      * @returns Path to CLI if found, or null
      */
     static async findCliPath(): Promise<string | null> {
@@ -292,7 +291,7 @@ export class SorobanCliService {
 
     /**
      * Set the source identity to use for transactions.
-     * 
+     *
      * @param source - Source identity name (e.g., 'dev')
      */
     setSource(source: string): void {
