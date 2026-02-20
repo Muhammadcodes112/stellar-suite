@@ -14,6 +14,7 @@ import { registerBackupCommands } from "./commands/backupCommands";
 import { registerReplayCommands } from "./commands/replayCommands";
 import { registerRetryCommands } from "./commands/retryCommands";
 import { registerCliHistoryCommands } from "./commands/cliHistoryCommands";
+import { registerSimulationComparisonCommands } from "./commands/simulationComparisonCommands";
 import { registerResourceProfilingCommands } from "./commands/resourceProfilingCommands";
 import { registerRpcAuthCommands } from "./commands/rpcAuthCommands";
 import { registerEnvVariableCommands } from "./commands/envVariableCommands";
@@ -305,6 +306,7 @@ export function activate(context: vscode.ExtensionContext) {
     registerSimulationHistoryCommands(context, simulationHistoryService!);
     // FIX: Use simulationReplayService (was incorrectly replayService in the old broken copy)
     registerReplayCommands(context, simulationHistoryService!, simulationReplayService!, sidebarProvider, fallbackService);
+    registerSimulationComparisonCommands(context, simulationHistoryService!);
     registerHealthCommands(context, healthMonitor!);
 
     // Sidebar actions
