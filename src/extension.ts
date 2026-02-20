@@ -1,31 +1,38 @@
-// ============================================================
-// src/extension.ts
-// Extension entry point — activates commands, sidebar, watchers.
-// ============================================================
+import * as vscode from "vscode";
 
-import * as vscode from 'vscode';
+// Commands
+import { buildContract } from "./commands/buildContract";
+import { deployContract } from "./commands/deployContract";
+import { deployBatch } from "./commands/deployBatch";
+import { simulateTransaction } from "./commands/simulateTransaction";
+import { manageCliConfiguration } from "./commands/manageCliConfiguration";
+import { registerGroupCommands } from "./commands/groupCommands";
+import { registerHealthCommands } from "./commands/healthCommands";
+import { registerSyncCommands } from "./commands/syncCommands";
+import { registerSimulationHistoryCommands } from "./commands/simulationHistoryCommands";
+import { registerBackupCommands } from "./commands/backupCommands";
+import { registerReplayCommands } from "./commands/replayCommands";
+import { registerResourceProfilingCommands } from "./commands/resourceProfilingCommands";
 
-import { buildContract } from './commands/buildContract';
-import { deployContract } from './commands/deployContract';
-import { registerGroupCommands } from './commands/groupCommands';
-import { registerHealthCommands } from './commands/healthCommands';
-import { manageCliConfiguration } from './commands/manageCliConfiguration';
-import { registerRpcLoggingCommands } from './commands/rpcLoggingCommands';
-import { simulateTransaction } from './commands/simulateTransaction';
-import { registerSyncCommands } from './commands/syncCommands';
+// Services
+import { ContractGroupService } from "./services/contractGroupService";
+import { ContractMetadataService } from "./services/contractMetadataService";
+import { ContractVersionTracker } from "./services/contractVersionTracker";
+import { WorkspaceStateSyncService } from "./services/workspaceStateSyncService";
+import { WorkspaceStateEncryptionService } from "./services/workspaceStateEncryptionService";
+import { RpcHealthMonitor } from "./services/rpcHealthMonitor";
+import { SimulationHistoryService } from "./services/simulationHistoryService";
+import { CompilationStatusMonitor } from "./services/compilationStatusMonitor";
+import { StateBackupService } from "./services/stateBackupService";
+import { SimulationReplayService } from "./services/simulationReplayService";
+import { ResourceProfilingService } from "./services/resourceProfilingService";
 
-import { ContractGroupService } from './services/contractGroupService';
-import { ContractMetadataService } from './services/contractMetadataService';
-import { ContractVersionTracker } from './services/contractVersionTracker';
-import { RpcHealthMonitor } from './services/rpcHealthMonitor';
-import { RpcLogger } from './services/rpcLogger';
-import { WorkspaceStateSyncService } from './services/workspaceStateSyncService';
+// UI
+import { SidebarViewProvider } from "./ui/sidebarView";
+import { SyncStatusProvider } from "./ui/syncStatusProvider";
+import { RpcHealthStatusBar } from "./ui/rpcHealthStatusBar";
+import { CompilationStatusProvider } from "./ui/compilationStatusProvider";
 
-import { RpcHealthStatusBar } from './ui/rpcHealthStatusBar';
-import { SidebarViewProvider } from './ui/sidebarView';
-import { SyncStatusProvider } from './ui/syncStatusProvider';
-
-import { deployBatch } from './commands/deployBatch';
 
 let sidebarProvider: SidebarViewProvider | undefined;
 let metadataService: ContractMetadataService | undefined;
@@ -37,43 +44,17 @@ let healthMonitor: RpcHealthMonitor | undefined;
 let healthStatusBar: RpcHealthStatusBar | undefined;
 
 let rpcLogger: RpcLogger | undefined;
+let simulationHistoryService: SimulationHistoryService | undefined;
+let compilationMonitor: CompilationStatusMonitor | undefined;
+let compilationStatusProvider: CompilationStatusProvider | undefined;
+let backupService: StateBackupService | undefined;
+let replayService: SimulationReplayService | undefined;
+let resourceProfilingService: ResourceProfilingService | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
   const outputChannel = vscode.window.createOutputChannel('Stellar Suite');
   outputChannel.appendLine('[Extension] Activating Stellar Suite extension...');
 
-        // Register group commands
-        registerGroupCommands(context, groupService);
-        outputChannel.appendLine('[Extension] Group commands registered');
-
-        // Initialize version tracker
-        versionTracker = new ContractVersionTracker(context, outputChannel);
-        outputChannel.appendLine('[Extension] Contract version tracker initialized');
-
-        // Initialize RPC retry service with circuit breaker
-        retryService = new RpcRetryService(
-            { resetTimeout: 60000, consecutiveFailuresThreshold: 3 },
-            { maxAttempts: 3, initialDelayMs: 100, maxDelayMs: 5000 },
-            false
-        );
-        retryStatusBar = new RetryStatusBarItem(retryService, 5000);
-        registerRetryCommands(context, retryService);
-        outputChannel.appendLine('[Extension] RPC retry service with circuit breaker initialized');
-
-        // Initialize workspace state synchronization
-        syncService = new WorkspaceStateSyncService(context);
-        syncStatusProvider = new SyncStatusProvider(syncService);
-        outputChannel.appendLine('[Extension] Workspace state sync service initialized');
-
-        // ── Sidebar ───────────────────────────────────────────
-        sidebarProvider = new SidebarViewProvider(context.extensionUri, context);
-        context.subscriptions.push(
-            vscode.window.registerWebviewViewProvider(
-                SidebarViewProvider.viewType,
-                sidebarProvider
-            )
-        );
-        outputChannel.appendLine('[Extension] Sidebar view provider registered');
   try {
     // ── Services ──────────────────────────────────────────────
     const groupService = new ContractGroupService(context);
@@ -132,8 +113,8 @@ export function activate(context: vscode.ExtensionContext) {
 
     // ── Commands ─────────────────────────────────────────────
     const simulateCommand = vscode.commands.registerCommand(
-      'stellarSuite.simulateTransaction',
-      () => simulateTransaction(context, sidebarProvider),
+      "stellarSuite.simulateTransaction",
+      () => simulateTransaction(context, sidebarProvider, simulationHistoryService, resourceProfilingService),
     );
 
     const deployCommand = vscode.commands.registerCommand(
@@ -157,13 +138,13 @@ export function activate(context: vscode.ExtensionContext) {
     );
 
     const deployFromSidebarCommand = vscode.commands.registerCommand(
-      'stellarSuite.deployFromSidebar',
+      "stellarSuite.deployFromSidebar",
       () => deployContract(context, sidebarProvider),
     );
 
     const simulateFromSidebarCommand = vscode.commands.registerCommand(
-      'stellarSuite.simulateFromSidebar',
-      () => simulateTransaction(context, sidebarProvider),
+      "stellarSuite.simulateFromSidebar",
+      () => simulateTransaction(context, sidebarProvider, simulationHistoryService, resourceProfilingService),
     );
 
     const copyContractIdCommand = vscode.commands.registerCommand(
@@ -192,10 +173,76 @@ export function activate(context: vscode.ExtensionContext) {
       },
     );
 
+    //  Batch deploy command 
     const deployBatchCommand = vscode.commands.registerCommand(
-  'stellarSuite.deployBatch',
-  () => deployBatch(context),
-);
+      "stellarSuite.deployBatch",
+      () => deployBatch(context),
+    );
+
+    //Compilation status commands
+    const showCompilationStatusCommand = vscode.commands.registerCommand(
+      "stellarSuite.showCompilationStatus",
+      async () => {
+        if (!compilationStatusProvider) {
+          vscode.window.showInformationMessage(
+            "Stellar Suite: Compilation status monitor not initialized.",
+          );
+          return;
+        }
+        await compilationStatusProvider.showCompilationStatus();
+      },
+    );
+
+    if (syncService) {
+      registerSyncCommands(context, syncService);
+      outputChannel.appendLine(
+        "[Extension] Workspace sync commands registered",
+      );
+    }
+
+    // Register simulation history commands
+    if (simulationHistoryService) {
+      registerSimulationHistoryCommands(context, simulationHistoryService);
+      outputChannel.appendLine(
+        "[Extension] Simulation history commands registered",
+      );
+    }
+
+    // Register backup commands
+    if (backupService) {
+      registerBackupCommands(context, backupService);
+      outputChannel.appendLine(
+        "[Extension] Backup commands registered",
+      );
+    }
+
+    if (simulationHistoryService) {
+      replayService = new SimulationReplayService(
+        simulationHistoryService,
+        outputChannel,
+      );
+      registerReplayCommands(
+        context,
+        simulationHistoryService,
+        replayService,
+        sidebarProvider,
+      );
+      outputChannel.appendLine(
+        "[Extension] Simulation replay service initialized and commands registered",
+      );
+    }
+
+    resourceProfilingService = new ResourceProfilingService(
+      context,
+      outputChannel,
+    );
+    registerResourceProfilingCommands(context, resourceProfilingService);
+    outputChannel.appendLine(
+      "[Extension] Resource profiling service initialized and commands registered",
+    );
+
+    outputChannel.appendLine("[Extension] All commands registered");
+
 
     // ── Watchers ─────────────────────────────────────────────
     const watcher = vscode.workspace.createFileSystemWatcher('**/{Cargo.toml,*.wasm}');
