@@ -1,6 +1,7 @@
 import { formatError } from '../utils/errorFormatter';
 import { CliErrorContext, CliErrorType } from '../utils/cliErrorParser';
 import { RpcLogger } from './rpcLogger';
+import { StateDiff, StateSnapshot } from '../types/simulationState';
 
 export interface SimulationResult {
     success: boolean;
@@ -16,6 +17,11 @@ export interface SimulationResult {
         cpuInstructions?: number;
         memoryBytes?: number;
     };
+    validationWarnings?: string[];
+    rawResult?: unknown;
+    stateSnapshotBefore?: StateSnapshot;
+    stateSnapshotAfter?: StateSnapshot;
+    stateDiff?: StateDiff;
 }
 
 /**
@@ -115,7 +121,8 @@ export class RpcService {
             return {
                 success: true,
                 result: result.returnValue || result.result || result,
-                resourceUsage: result.resourceUsage || result.resource_usage
+                resourceUsage: result.resourceUsage || result.resource_usage,
+                rawResult: result,
             };
         } catch (error) {
             const errorMessage = this.formatErrorMessage(error);

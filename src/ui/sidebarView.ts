@@ -634,6 +634,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         const workspaceFolders = vscode.workspace.workspaceFolders;
         if (!workspaceFolders) { return []; }
 
+        const deploymentHistory = this._getDeploymentHistory();
         const hidden = this._context.workspaceState.get<string[]>('stellarSuite.hiddenContracts', []);
         const aliases = this._context.workspaceState.get<Record<string, string>>('stellarSuite.contractAliases', {});
         const pinned = this._context.workspaceState.get<string[]>('stellarSuite.pinnedContracts', []);
@@ -653,7 +654,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 }
             }
 
-            const found = this._findContracts(folder.uri.fsPath, 0, {
+            const found = this._findContracts(folder.uri.fsPath, 0, deploymentHistory, {
                 customTemplates: templateConfig.templates,
                 manualTemplateAssignments,
             });
@@ -673,6 +674,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
     private _findContracts(
         rootPath: string,
         depth = 0,
+        deploymentHistory: DeploymentRecord[] = [],
         options?: {
             customTemplates?: TemplateDefinition[];
             manualTemplateAssignments?: Record<string, string>;
@@ -700,13 +702,16 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
 
                 const wasmPath = path.join(rootPath, 'target', 'wasm32-unknown-unknown', 'release');
                 const isBuilt = fs.existsSync(wasmPath) &&
-                    fs.readdirSync(wasmPath).some(f => f.endsWith('.wasm'));
+                    fs.readdirSync(wasmPath).some((f: string) => f.endsWith('.wasm'));
 
                 const deployedContracts = this._context.workspaceState.get<Record<string, string>>(
                     'stellarSuite.deployedContracts', {}
                 );
                 const contractId = deployedContracts[rootPath];
                 const config = vscode.workspace.getConfiguration('stellarSuite');
+                const lastDeployment = contractId
+                    ? [...deploymentHistory].reverse().find(d => d.contractId === contractId)
+                    : undefined;
 
                 // ── Version info ──────────────────────────────
                 const versionState = this.versionTracker.getContractVersionState(
@@ -726,8 +731,10 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     contractId,
                     isBuilt,
                     hasWasm: isBuilt,
-                    network: config.get<string>('network', 'testnet'),
-                    source: config.get<string>('source', 'dev'),
+                    deployedAt: lastDeployment?.deployedAt,
+                    lastDeployed: lastDeployment?.deployedAt,
+                    network: lastDeployment?.network ?? config.get<string>('network', 'testnet'),
+                    source: lastDeployment?.source ?? config.get<string>('source', 'dev'),
                     localVersion: versionState.localVersion,
                     deployedVersion: versionState.deployedVersion,
                     hasVersionMismatch: versionState.hasMismatch,
@@ -746,7 +753,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         for (const entry of entries) {
             if (!entry.isDirectory()) { continue; }
             if (['target', 'node_modules', '.git', 'out'].includes(entry.name)) { continue; }
-            results.push(...this._findContracts(path.join(rootPath, entry.name), depth + 1, options));
+            results.push(...this._findContracts(path.join(rootPath, entry.name), depth + 1, deploymentHistory));
         }
 
         return results;

@@ -1,5 +1,7 @@
 import * as vscode from 'vscode';
 import { SimulationResult } from '../services/sorobanCliService';
+import { StateDiffService } from '../services/stateDiffService';
+import { StateDiffChange } from '../types/simulationState';
 
 /**
  * Manages the WebView panel that displays simulation results.
@@ -7,9 +9,13 @@ import { SimulationResult } from '../services/sorobanCliService';
 export class SimulationPanel {
     private static currentPanel: SimulationPanel | undefined;
     private readonly _panel: vscode.WebviewPanel;
+    private readonly stateDiffService = new StateDiffService();
     private _disposables: vscode.Disposable[] = [];
+    private _latestStateDiff = undefined as SimulationResult['stateDiff'];
+    private _latestContractId = '';
+    private _latestFunctionName = '';
 
-    private constructor(panel: vscode.WebviewPanel, context: vscode.ExtensionContext) {
+    private constructor(panel: vscode.WebviewPanel, _context: vscode.ExtensionContext) {
         this._panel = panel;
 
         // Set the webview's initial html content
@@ -21,10 +27,13 @@ export class SimulationPanel {
 
         // Handle messages from the webview
         this._panel.webview.onDidReceiveMessage(
-            message => {
+            async message => {
                 switch (message.command) {
                     case 'refresh':
                         this._update();
+                        return;
+                    case 'exportStateDiff':
+                        await this.exportStateDiff();
                         return;
                 }
             },
@@ -66,6 +75,9 @@ export class SimulationPanel {
      * Update the panel content with simulation results.
      */
     public updateResults(result: SimulationResult, contractId: string, functionName: string, args: any[]): void {
+        this._latestStateDiff = result.stateDiff;
+        this._latestContractId = contractId;
+        this._latestFunctionName = functionName;
         this._panel.webview.html = this._getHtmlForResults(result, contractId, functionName, args);
     }
 
@@ -84,6 +96,39 @@ export class SimulationPanel {
                 x.dispose();
             }
         }
+    }
+
+    private async exportStateDiff(): Promise<void> {
+        if (!this._latestStateDiff) {
+            vscode.window.showInformationMessage('Stellar Suite: No state diff to export.');
+            return;
+        }
+
+        const defaultName = `simulation-state-diff-${this.sanitizeForFileName(this._latestContractId)}-${this.sanitizeForFileName(this._latestFunctionName)}.json`;
+        const uri = await vscode.window.showSaveDialog({
+            defaultUri: vscode.Uri.file(defaultName),
+            filters: { 'JSON Files': ['json'] },
+            title: 'Export State Diff',
+        });
+
+        if (!uri) {
+            return;
+        }
+
+        try {
+            const payload = this.stateDiffService.exportStateDiff(this._latestStateDiff, {
+                includeSnapshots: true,
+            });
+            await vscode.workspace.fs.writeFile(uri, Buffer.from(payload, 'utf-8'));
+            vscode.window.showInformationMessage('Stellar Suite: State diff exported successfully.');
+        } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            vscode.window.showErrorMessage(`Stellar Suite: Failed to export state diff — ${msg}`);
+        }
+    }
+
+    private sanitizeForFileName(value: string): string {
+        return value.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48) || 'simulation';
     }
 
     private _update() {
@@ -176,8 +221,8 @@ export class SimulationPanel {
             </ul>
             `
             : '';
-    
-     const validationWarningsHtml = result.validationWarnings && result.validationWarnings.length > 0
+
+        const validationWarningsHtml = result.validationWarnings && result.validationWarnings.length > 0
             ? `
             <div class="section">
                 <h3>Pre-execution Warnings</h3>
@@ -187,6 +232,87 @@ export class SimulationPanel {
             </div>
             `
             : '';
+
+        const renderChangeRows = (changes: StateDiffChange[], changeType: 'created' | 'modified' | 'deleted') => {
+            if (changes.length === 0) {
+                return '<tr><td colspan="4"><em>No entries</em></td></tr>';
+            }
+
+            return changes.map(change => {
+                const beforeValue = changeType === 'created'
+                    ? '<em>n/a</em>'
+                    : formatValue(change.beforeValue);
+                const afterValue = changeType === 'deleted'
+                    ? '<em>n/a</em>'
+                    : formatValue(change.afterValue);
+
+                return `
+                <tr class="diff-row diff-row-${changeType}">
+                    <td><code>${escapeHtml(change.key)}</code></td>
+                    <td>${change.contractId ? `<code>${escapeHtml(change.contractId)}</code>` : '<em>global</em>'}</td>
+                    <td>${beforeValue}</td>
+                    <td>${afterValue}</td>
+                </tr>
+                `;
+            }).join('');
+        };
+
+        const stateDiffHtml = result.stateDiff
+            ? `
+            <div class="section">
+                <h3>State Diff</h3>
+                <div class="diff-actions">
+                    <button class="btn" onclick="exportStateDiff()">Export State Diff</button>
+                </div>
+
+                <div class="diff-summary-grid">
+                    <div class="diff-summary-item"><strong>Before:</strong> ${result.stateDiff.summary.totalEntriesBefore}</div>
+                    <div class="diff-summary-item"><strong>After:</strong> ${result.stateDiff.summary.totalEntriesAfter}</div>
+                    <div class="diff-summary-item created"><strong>Created:</strong> ${result.stateDiff.summary.created}</div>
+                    <div class="diff-summary-item modified"><strong>Modified:</strong> ${result.stateDiff.summary.modified}</div>
+                    <div class="diff-summary-item deleted"><strong>Deleted:</strong> ${result.stateDiff.summary.deleted}</div>
+                    <div class="diff-summary-item"><strong>Unchanged:</strong> ${result.stateDiff.summary.unchanged}</div>
+                </div>
+
+                <div class="state-change-group">
+                    <h4>Modified Entries</h4>
+                    <table>
+                        <thead>
+                            <tr><th>Key</th><th>Contract</th><th>Before</th><th>After</th></tr>
+                        </thead>
+                        <tbody>
+                            ${renderChangeRows(result.stateDiff.modified, 'modified')}
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="state-change-group">
+                    <h4>Created Entries</h4>
+                    <table>
+                        <thead>
+                            <tr><th>Key</th><th>Contract</th><th>Before</th><th>After</th></tr>
+                        </thead>
+                        <tbody>
+                            ${renderChangeRows(result.stateDiff.created, 'created')}
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="state-change-group">
+                    <h4>Deleted Entries</h4>
+                    <table>
+                        <thead>
+                            <tr><th>Key</th><th>Contract</th><th>Before</th><th>After</th></tr>
+                        </thead>
+                        <tbody>
+                            ${renderChangeRows(result.stateDiff.deleted, 'deleted')}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            `
+            : '';
+
         return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -229,9 +355,12 @@ export class SimulationPanel {
             width: 100%;
             border-collapse: collapse;
         }
-        table td {
+        table td,
+        table th {
             padding: 8px 12px;
             border-bottom: 1px solid var(--vscode-panel-border);
+            text-align: left;
+            vertical-align: top;
         }
         table td:first-child {
             font-weight: 600;
@@ -272,7 +401,7 @@ export class SimulationPanel {
         .error-suggestions li {
             margin-bottom: 6px;
         }
-         .validation-warnings {
+        .validation-warnings {
             margin-top: 12px;
             padding-left: 20px;
             color: var(--vscode-editorWarning-foreground);
@@ -285,6 +414,56 @@ export class SimulationPanel {
             padding: 12px;
             border-radius: 4px;
             border: 1px solid var(--vscode-panel-border);
+        }
+        .diff-actions {
+            margin-bottom: 12px;
+        }
+        .btn {
+            border: 1px solid var(--vscode-button-border, transparent);
+            background-color: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .btn:hover {
+            background-color: var(--vscode-button-hoverBackground);
+        }
+        .diff-summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 8px;
+            margin-bottom: 16px;
+        }
+        .diff-summary-item {
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 4px;
+            padding: 8px 10px;
+            background-color: var(--vscode-textCodeBlock-background);
+        }
+        .diff-summary-item.created {
+            border-left: 3px solid var(--vscode-testing-iconPassed);
+        }
+        .diff-summary-item.modified {
+            border-left: 3px solid var(--vscode-editorWarning-foreground);
+        }
+        .diff-summary-item.deleted {
+            border-left: 3px solid var(--vscode-testing-iconFailed);
+        }
+        .state-change-group {
+            margin-bottom: 18px;
+        }
+        .state-change-group h4 {
+            margin-bottom: 8px;
+        }
+        .diff-row-created {
+            background-color: color-mix(in srgb, var(--vscode-testing-iconPassed) 15%, transparent);
+        }
+        .diff-row-modified {
+            background-color: color-mix(in srgb, var(--vscode-editorWarning-foreground) 15%, transparent);
+        }
+        .diff-row-deleted {
+            background-color: color-mix(in srgb, var(--vscode-testing-iconFailed) 15%, transparent);
         }
     </style>
 </head>
@@ -302,7 +481,7 @@ export class SimulationPanel {
         </table>
     </div>
 
-      ${validationWarningsHtml}
+    ${validationWarningsHtml}
     ${result.success
         ? `
         <div class="section">
@@ -324,6 +503,15 @@ export class SimulationPanel {
         </div>
         `
     }
+
+    ${stateDiffHtml}
+
+    <script>
+        const vscode = acquireVsCodeApi();
+        function exportStateDiff() {
+            vscode.postMessage({ command: 'exportStateDiff' });
+        }
+    </script>
 </body>
 </html>`;
     }

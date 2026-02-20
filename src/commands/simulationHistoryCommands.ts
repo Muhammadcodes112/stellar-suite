@@ -99,6 +99,17 @@ async function showSimulationHistory(service: SimulationHistoryService): Promise
             channel.appendLine(`Memory: ${(e.resourceUsage.memoryBytes / 1024).toFixed(2)} KB`);
         }
     }
+    if (e.stateDiff) {
+        channel.appendLine('');
+        channel.appendLine('── State Diff ──');
+        channel.appendLine(`Entries Before: ${e.stateDiff.summary.totalEntriesBefore}`);
+        channel.appendLine(`Entries After:  ${e.stateDiff.summary.totalEntriesAfter}`);
+        channel.appendLine(`Created:        ${e.stateDiff.summary.created}`);
+        channel.appendLine(`Modified:       ${e.stateDiff.summary.modified}`);
+        channel.appendLine(`Deleted:        ${e.stateDiff.summary.deleted}`);
+        channel.appendLine(`Unchanged:      ${e.stateDiff.summary.unchanged}`);
+        channel.appendLine(`Total Changes:  ${e.stateDiff.summary.totalChanges}`);
+    }
     channel.show(true);
 }
 

@@ -10,6 +10,7 @@ import {
     SimulationHistoryEntry,
     SimulationOutcome,
 } from './simulationHistoryService';
+import { StateDiff, StateSnapshot } from '../types/simulationState';
 
 // ── Public types ──────────────────────────────────────────────
 
@@ -53,6 +54,12 @@ export interface ReplayResult {
     durationMs?: number;
     /** Comparison with the original simulation. */
     comparison: ReplayComparison;
+    /** Captured storage snapshot before replay execution. */
+    stateSnapshotBefore?: StateSnapshot;
+    /** Captured storage snapshot after replay execution. */
+    stateSnapshotAfter?: StateSnapshot;
+    /** Computed storage-level diff for replay execution. */
+    stateDiff?: StateDiff;
 }
 
 /** Comparison between original and replayed simulation. */
@@ -86,6 +93,9 @@ export type SimulationExecutor = (params: ReplayParameters) => Promise<{
     error?: string;
     errorType?: string;
     resourceUsage?: { cpuInstructions?: number; memoryBytes?: number };
+    stateSnapshotBefore?: StateSnapshot;
+    stateSnapshotAfter?: StateSnapshot;
+    stateDiff?: StateDiff;
     durationMs?: number;
 }>;
 
@@ -177,6 +187,9 @@ export class SimulationReplayService {
             method: parameters.method,
             durationMs,
             label: replayLabel,
+            stateSnapshotBefore: execResult.stateSnapshotBefore,
+            stateSnapshotAfter: execResult.stateSnapshotAfter,
+            stateDiff: execResult.stateDiff,
         });
 
         const replayOutcome: SimulationOutcome = execResult.success ? 'success' : 'failure';
@@ -192,6 +205,9 @@ export class SimulationReplayService {
             error: execResult.error,
             durationMs,
             comparison,
+            stateSnapshotBefore: execResult.stateSnapshotBefore,
+            stateSnapshotAfter: execResult.stateSnapshotAfter,
+            stateDiff: execResult.stateDiff,
         };
 
         this.log(
@@ -330,6 +346,7 @@ export class SimulationReplayService {
                 modifiedFields: r.comparison.modifiedFields,
                 outcomeChanged: r.comparison.outcomeChanged,
                 originalOutcome: r.comparison.originalOutcome,
+                stateChanges: r.stateDiff?.summary.totalChanges ?? 0,
             })),
         }, null, 2);
     }

@@ -36,9 +36,12 @@ export async function buildContract(
             {
                 location: vscode.ProgressLocation.Notification,
                 title: 'Building Contract',
-                cancellable: false
+                cancellable: true
             },
-            async (progress: vscode.Progress<{ message?: string; increment?: number }>) => {
+            async (
+                progress: vscode.Progress<{ message?: string; increment?: number }>,
+                token: vscode.CancellationToken
+            ) => {
                 progress.report({ increment: 0, message: 'Detecting contract...' });
 
                 let contractDir: string | null = null;
@@ -106,7 +109,45 @@ export async function buildContract(
                 outputChannel.appendLine('Running: stellar contract build\n');
 
                 const deployer = new ContractDeployer(cliPath, source, network);
-                const buildResult = await deployer.buildContract(contractDir);
+                let lastProgressUpdate = 0;
+
+                const updateStreamingStatus = (chunk: string): void => {
+                    const trimmed = chunk
+                        .split('\n')
+                        .map(line => line.trim())
+                        .filter(line => line.length > 0)
+                        .pop();
+                    if (!trimmed) {
+                        return;
+                    }
+
+                    const now = Date.now();
+                    if (now - lastProgressUpdate < 500) {
+                        return;
+                    }
+                    lastProgressUpdate = now;
+
+                    const statusMessage = trimmed.length > 80
+                        ? `${trimmed.slice(0, 79)}…`
+                        : trimmed;
+
+                    progress.report({ message: `Building… ${statusMessage}` });
+                    if (monitor) {
+                        monitor.updateProgress(contractDir, 55, `Streaming build output: ${statusMessage}`);
+                    }
+                };
+
+                const buildResult = await deployer.buildContract(contractDir, {
+                    cancellationToken: token,
+                    onStdout: (chunk) => {
+                        outputChannel.append(chunk);
+                        updateStreamingStatus(chunk);
+                    },
+                    onStderr: (chunk) => {
+                        outputChannel.append(chunk);
+                        updateStreamingStatus(chunk);
+                    },
+                });
 
                 progress.report({ increment: 90, message: 'Finalizing...' });
                 
@@ -134,6 +175,12 @@ export async function buildContract(
                     if (sidebarProvider) {
                         await sidebarProvider.refresh();
                     }
+                } else if (buildResult.cancelled || token.isCancellationRequested) {
+                    outputChannel.appendLine('⚠️ Build cancelled by user.');
+                    if (monitor) {
+                        monitor.reportCancellation(contractDir);
+                    }
+                    vscode.window.showWarningMessage('Contract build cancelled.');
                 } else {
                     outputChannel.appendLine(`❌ Build failed!`);
                     outputChannel.appendLine(`Error: ${buildResult.output}`);

@@ -435,6 +435,59 @@ async function testDurationMs() {
     console.log('  [ok] durationMs is stored correctly');
 }
 
+async function testRecordSimulationWithStateDiff() {
+    const { svc } = createService();
+    const entry = await svc.recordSimulation(makeParams({
+        stateSnapshotBefore: {
+            capturedAt: new Date().toISOString(),
+            source: 'before',
+            entries: [{ key: 'counter', value: 1 }],
+        },
+        stateSnapshotAfter: {
+            capturedAt: new Date().toISOString(),
+            source: 'after',
+            entries: [{ key: 'counter', value: 2 }],
+        },
+        stateDiff: {
+            before: {
+                capturedAt: new Date().toISOString(),
+                source: 'before',
+                entries: [{ key: 'counter', value: 1 }],
+            },
+            after: {
+                capturedAt: new Date().toISOString(),
+                source: 'after',
+                entries: [{ key: 'counter', value: 2 }],
+            },
+            created: [],
+            modified: [{
+                type: 'modified',
+                key: 'counter',
+                beforeValue: 1,
+                afterValue: 2,
+            }],
+            deleted: [],
+            unchangedKeys: [],
+            summary: {
+                totalEntriesBefore: 1,
+                totalEntriesAfter: 1,
+                created: 0,
+                modified: 1,
+                deleted: 0,
+                unchanged: 0,
+                totalChanges: 1,
+            },
+            hasChanges: true,
+        },
+    }));
+
+    assert.ok(entry.stateSnapshotBefore);
+    assert.ok(entry.stateSnapshotAfter);
+    assert.ok(entry.stateDiff);
+    assert.strictEqual(entry.stateDiff!.summary.totalChanges, 1);
+    console.log('  [ok] recordSimulation stores state snapshot and diff metadata');
+}
+
 async function testQueryFilterByDateRange() {
     const { svc, ctx } = createService();
     const now = Date.now();
@@ -507,6 +560,7 @@ async function run() {
         testImportHistorySkipsInvalidEntries,
         testHistoryTrimming,
         testDurationMs,
+        testRecordSimulationWithStateDiff,
         testQueryFilterByDateRange,
         testGetEntryCount,
         testOutputChannelLogging,

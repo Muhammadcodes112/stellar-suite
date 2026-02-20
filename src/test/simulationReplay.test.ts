@@ -143,6 +143,67 @@ async function testReplayRecordsInHistory() {
     console.log('  [ok] replay records new entry in simulation history');
 }
 
+async function testReplayCarriesStateDiffMetadata() {
+    const { historyService, replayService } = createServices();
+    const entry = await historyService.recordSimulation(makeParams());
+
+    const executor: SimulationExecutor = async () => ({
+        success: true,
+        result: 'ok',
+        durationMs: 90,
+        stateSnapshotBefore: {
+            capturedAt: new Date().toISOString(),
+            source: 'before',
+            entries: [{ key: 'counter', value: 1 }],
+        },
+        stateSnapshotAfter: {
+            capturedAt: new Date().toISOString(),
+            source: 'after',
+            entries: [{ key: 'counter', value: 2 }],
+        },
+        stateDiff: {
+            before: {
+                capturedAt: new Date().toISOString(),
+                source: 'before',
+                entries: [{ key: 'counter', value: 1 }],
+            },
+            after: {
+                capturedAt: new Date().toISOString(),
+                source: 'after',
+                entries: [{ key: 'counter', value: 2 }],
+            },
+            created: [],
+            modified: [{
+                type: 'modified',
+                key: 'counter',
+                beforeValue: 1,
+                afterValue: 2,
+            }],
+            deleted: [],
+            unchangedKeys: [],
+            summary: {
+                totalEntriesBefore: 1,
+                totalEntriesAfter: 1,
+                created: 0,
+                modified: 1,
+                deleted: 0,
+                unchanged: 0,
+                totalChanges: 1,
+            },
+            hasChanges: true,
+        },
+    });
+
+    const replay = await replayService.replaySimulation(entry.id, executor);
+    assert.ok(replay.stateDiff, 'replay result should include state diff');
+    assert.strictEqual(replay.stateDiff!.summary.totalChanges, 1);
+
+    const stored = historyService.getEntry(replay.newEntryId);
+    assert.ok(stored?.stateDiff, 'stored history should include state diff');
+    assert.strictEqual(stored!.stateDiff!.summary.totalChanges, 1);
+    console.log('  [ok] replay carries state snapshots and diff metadata through history');
+}
+
 async function testReplayNotFoundEntry() {
     const { replayService } = createServices();
     let threw = false;
@@ -612,6 +673,7 @@ async function run() {
         testReplaySimulationSuccess,
         testReplaySimulationFailure,
         testReplayRecordsInHistory,
+        testReplayCarriesStateDiffMetadata,
         testReplayNotFoundEntry,
         testReplayWithOverrides,
         testReplayWithArgsOverride,
