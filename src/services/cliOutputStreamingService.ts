@@ -1,6 +1,10 @@
 declare function require(name: string): any;
 
 import { StreamBuffer } from '../utils/streamBuffer';
+import { CancellationToken } from './cliCancellation';
+import { CliTimeoutService } from './cliTimeoutService';
+import { CliCleanupUtilities } from '../utils/cliCleanupUtilities';
+import { TimeoutIndicators } from '../ui/timeoutIndicators';
 
 const { spawn } = require('child_process') as { spawn: any };
 
@@ -12,10 +16,8 @@ export interface CliOutputChunk {
     timestamp: string;
 }
 
-export interface CliStreamingCancellationToken {
-    isCancellationRequested: boolean;
-    onCancellationRequested?: (listener: () => void) => { dispose(): void };
-}
+// Export the generic type so other files using it still work, or they can switch.
+export { CancellationToken as CliStreamingCancellationToken } from './cliCancellation';
 
 export interface CliOutputStreamingRequest {
     command: string;
@@ -24,7 +26,7 @@ export interface CliOutputStreamingRequest {
     env?: Record<string, string | undefined>;
     timeoutMs?: number;
     maxBufferedBytes?: number;
-    cancellationToken?: CliStreamingCancellationToken;
+    cancellationToken?: CancellationToken;
     onChunk?: (chunk: CliOutputChunk) => void;
     onStdout?: (text: string) => void;
     onStderr?: (text: string) => void;
@@ -72,9 +74,14 @@ export class CliOutputStreamingService {
             let resolved = false;
             let cancelled = false;
             let timedOut = false;
-            let killTimer: ReturnType<typeof setTimeout> | undefined;
-            let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
             let cancellationDisposable: { dispose(): void } | undefined;
+
+            const timeoutService = new CliTimeoutService({
+                defaultTimeoutMs: request.timeoutMs || 0,
+                warningThresholdMs: 10000,
+            });
+
+            const cleanupUtilities = new CliCleanupUtilities();
 
             const child = spawn(request.command, request.args, {
                 cwd: request.cwd,
@@ -83,10 +90,16 @@ export class CliOutputStreamingService {
                 shell: false,
             });
 
+            if (child.pid) {
+                cleanupUtilities.registerTask({
+                    type: 'process',
+                    target: child.pid,
+                    description: `Command ${request.command}`,
+                });
+            }
+
             const emitChunk = (stream: CliOutputStream, text: string): void => {
-                if (!text) {
-                    return;
-                }
+                if (!text) return;
 
                 const chunk: CliOutputChunk = {
                     stream,
@@ -108,45 +121,25 @@ export class CliOutputStreamingService {
             };
 
             const finish = (result: CliOutputStreamingResult): void => {
-                if (resolved) {
-                    return;
-                }
+                if (resolved) return;
                 resolved = true;
 
-                if (timeoutHandle) {
-                    clearTimeout(timeoutHandle);
-                }
-                if (killTimer) {
-                    clearTimeout(killTimer);
-                }
+                timeoutService.stop();
                 cancellationDisposable?.dispose();
 
                 resolve(result);
             };
 
-            const terminate = (): void => {
-                if (child.killed) {
-                    return;
-                }
-
-                child.kill('SIGTERM');
-                killTimer = setTimeout(() => {
-                    if (!child.killed) {
-                        child.kill('SIGKILL');
-                    }
-                }, 2000);
+            const terminate = async (): Promise<void> => {
+                if (child.killed) return;
+                await cleanupUtilities.cleanupAll();
             };
 
             child.stdout?.setEncoding('utf8');
             child.stderr?.setEncoding('utf8');
 
-            child.stdout?.on('data', (chunk: unknown) => {
-                emitChunk('stdout', String(chunk));
-            });
-
-            child.stderr?.on('data', (chunk: unknown) => {
-                emitChunk('stderr', String(chunk));
-            });
+            child.stdout?.on('data', (chunk: unknown) => emitChunk('stdout', String(chunk)));
+            child.stderr?.on('data', (chunk: unknown) => emitChunk('stderr', String(chunk)));
 
             child.on('error', (error: Error) => {
                 const errText = error.message || 'Failed to start command.';
@@ -195,17 +188,33 @@ export class CliOutputStreamingService {
             });
 
             if (request.timeoutMs && request.timeoutMs > 0) {
-                timeoutHandle = setTimeout(() => {
-                    timedOut = true;
-                    emitChunk('system', `[stream-timeout] Timed out after ${request.timeoutMs}ms\n`);
-                    terminate();
-                }, request.timeoutMs);
+                timeoutService.on('event', (event) => {
+                    if (event.type === 'warning') {
+                        TimeoutIndicators.showWarning(timeoutService, event.remainingMs);
+                        emitChunk('system', `[stream-warning] Command will timeout in ${Math.round(event.remainingMs / 1000)}s\n`);
+                    } else if (event.type === 'timeout') {
+                        timedOut = true;
+                        TimeoutIndicators.showTimeoutMessage();
+                        emitChunk('system', `[stream-timeout] Timed out after ${timeoutService['currentTimeoutMs']}ms\n`);
+                        terminate();
+                    } else if (event.type === 'cancelled') {
+                        cancelled = true;
+                        TimeoutIndicators.showCancellationPrompt();
+                        emitChunk('system', '[stream-cancelled] Cancellation requested\n');
+                        terminate();
+                    } else if (event.type === 'extended') {
+                        emitChunk('system', `[stream-info] Timeout extended. New timeout: ${event.newTimeoutMs}ms\n`);
+                    }
+                });
+
+                timeoutService.start(request.command, request.timeoutMs);
             }
 
             if (request.cancellationToken?.onCancellationRequested) {
                 cancellationDisposable = request.cancellationToken.onCancellationRequested(() => {
                     cancelled = true;
-                    emitChunk('system', '[stream-cancelled] Cancellation requested\n');
+                    // Provide a calm, actionable cancellation message
+                    emitChunk('system', '[stream-cancelled] Operation aborted by user. Cleaning up...\n');
                     terminate();
                 });
             }

@@ -189,9 +189,9 @@ export class CompilationStatusMonitor {
         const warnings = diagnostics.filter(d => d.severity === CompilationDiagnosticSeverity.WARNING);
         const errors = diagnostics.filter(d => d.severity === CompilationDiagnosticSeverity.ERROR);
 
-        const status = errors.length > 0 ? CompilationStatus.FAILED : 
-                      warnings.length > 0 ? CompilationStatus.WARNING : 
-                      CompilationStatus.SUCCESS;
+        const status = errors.length > 0 ? CompilationStatus.FAILED :
+            warnings.length > 0 ? CompilationStatus.WARNING :
+                CompilationStatus.SUCCESS;
 
         const record: CompilationRecord = {
             contractPath,
@@ -217,8 +217,8 @@ export class CompilationStatusMonitor {
      * Report compilation failure.
      */
     reportFailure(
-        contractPath: string, 
-        errorMessage: string, 
+        contractPath: string,
+        errorMessage: string,
         diagnostics: CompilationDiagnostic[] = [],
         output?: string
     ): CompilationRecord {
@@ -277,8 +277,8 @@ export class CompilationStatusMonitor {
      * Finalize a compilation and update history.
      */
     private finalizeCompilation(
-        contractPath: string, 
-        record: CompilationRecord, 
+        contractPath: string,
+        record: CompilationRecord,
         finalStatus: CompilationStatus
     ): void {
         const current = this.currentStatuses.get(contractPath);
@@ -478,8 +478,8 @@ export class CompilationStatusMonitor {
             // Example: error[E0000]: message at path/to/file.rs:10:5
             const errorMatch = line.match(/^(error|warning)\s*(?:\[(E\d+)\])?\s*:\s*(.+)$/i);
             if (errorMatch) {
-                const severity = errorMatch[1].toLowerCase() === 'error' 
-                    ? CompilationDiagnosticSeverity.ERROR 
+                const severity = errorMatch[1].toLowerCase() === 'error'
+                    ? CompilationDiagnosticSeverity.ERROR
                     : CompilationDiagnosticSeverity.WARNING;
                 const code = errorMatch[2];
                 const message = errorMatch[3].trim();
