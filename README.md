@@ -78,6 +78,10 @@ The extension includes a sidebar panel that displays:
 - Deployment history
 - Quick actions for build, deploy, and simulate
 
+### Real-Time CLI Output
+
+Long-running CLI operations (like contract builds) stream `stdout` and `stderr` directly into VS Code output channels so you can monitor progress live, with cancellation support and bounded buffering for large logs.
+
 ## Installation
 
 ### From VS Code Marketplace
