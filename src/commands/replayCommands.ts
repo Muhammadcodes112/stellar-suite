@@ -13,11 +13,13 @@ import {
     SimulationExecutor,
 } from '../services/simulationReplayService';
 import { SorobanCliService } from '../services/sorobanCliService';
-import { RpcService } from '../services/rpcService';
+import { RpcService, SimulationResult } from '../services/rpcService';
 import { RpcFallbackService } from '../services/rpcFallbackService';
 import { SimulationPanel } from '../ui/simulationPanel';
 import { SidebarViewProvider } from '../ui/sidebarView';
 import { resolveCliConfigurationForCommand } from '../services/cliConfigurationVscode';
+import { StateCaptureService } from '../services/stateCaptureService';
+import { StateDiffService } from '../services/stateDiffService';
 
 /**
  * Register all simulation replay commands with the extension context.
@@ -347,6 +349,20 @@ async function buildExecutor(
 
     return async (params: ReplayParameters) => {
         const startTime = Date.now();
+        const stateCaptureService = new StateCaptureService();
+        const stateDiffService = new StateDiffService();
+
+        const buildStateDiff = (rawResult: unknown) => {
+            const baselineBefore = stateCaptureService.captureBeforeState(undefined);
+            const captured = stateCaptureService.captureSnapshots(rawResult);
+            const before = captured.before.entries.length > 0 ? captured.before : baselineBefore;
+            const after = captured.after;
+            return {
+                stateSnapshotBefore: before,
+                stateSnapshotAfter: after,
+                stateDiff: stateDiffService.calculateDiff(before, after),
+            };
+        };
 
         if (params.method === 'cli' || config.useLocalCli) {
             let actualCliPath = config.cliPath;
@@ -377,47 +393,49 @@ async function buildExecutor(
                 params.network
             );
 
+            const stateData = buildStateDiff(result.rawResult ?? result.result);
+
             return {
                 success: result.success,
                 result: result.result,
                 error: result.error,
                 errorType: result.errorType,
                 resourceUsage: result.resourceUsage,
+                stateSnapshotBefore: stateData.stateSnapshotBefore,
+                stateSnapshotAfter: stateData.stateSnapshotAfter,
+                stateDiff: stateData.stateDiff,
                 durationMs: Date.now() - startTime,
             };
         } else {
+            let result: SimulationResult;
             if (fallbackService) {
-                const result = await fallbackService.simulateTransaction(
+                result = await fallbackService.simulateTransaction(
                     params.contractId,
                     params.functionName,
                     params.args as any[]
                 );
-
-                return {
-                    success: result.success,
-                    result: result.result,
-                    error: result.error,
-                    errorType: result.errorType,
-                    resourceUsage: result.resourceUsage,
-                    durationMs: Date.now() - startTime,
-                };
             } else {
                 const rpcService = new RpcService(config.rpcUrl);
-                const result = await rpcService.simulateTransaction(
+                result = await rpcService.simulateTransaction(
                     params.contractId,
                     params.functionName,
                     params.args as any[]
                 );
-
-                return {
-                    success: result.success,
-                    result: result.result,
-                    error: result.error,
-                    errorType: result.errorType,
-                    resourceUsage: result.resourceUsage,
-                    durationMs: Date.now() - startTime,
-                };
             }
+
+            const stateData = buildStateDiff(result.rawResult ?? result.result);
+
+            return {
+                success: result.success,
+                result: result.result,
+                error: result.error,
+                errorType: result.errorType,
+                resourceUsage: result.resourceUsage,
+                stateSnapshotBefore: stateData.stateSnapshotBefore,
+                stateSnapshotAfter: stateData.stateSnapshotAfter,
+                stateDiff: stateData.stateDiff,
+                durationMs: Date.now() - startTime,
+            };
         }
     };
 }
@@ -459,6 +477,9 @@ async function executeReplay(
                     success: result.outcome === 'success',
                     result: result.result,
                     error: result.error,
+                    stateSnapshotBefore: result.stateSnapshotBefore,
+                    stateSnapshotAfter: result.stateSnapshotAfter,
+                    stateDiff: result.stateDiff,
                 },
                 result.parameters.contractId,
                 result.parameters.functionName,
@@ -471,6 +492,9 @@ async function executeReplay(
                     success: result.outcome === 'success',
                     result: result.result,
                     error: result.error,
+                    stateSnapshotBefore: result.stateSnapshotBefore,
+                    stateSnapshotAfter: result.stateSnapshotAfter,
+                    stateDiff: result.stateDiff,
                 });
             }
 

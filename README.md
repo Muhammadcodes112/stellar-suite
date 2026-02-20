@@ -78,6 +78,10 @@ The extension includes a sidebar panel that displays:
 - Deployment history
 - Quick actions for build, deploy, and simulate
 
+### Real-Time CLI Output
+
+Long-running CLI operations (like contract builds) stream `stdout` and `stderr` directly into VS Code output channels so you can monitor progress live, with cancellation support and bounded buffering for large logs.
+
 ## Installation
 
 ### From VS Code Marketplace
@@ -124,13 +128,28 @@ The extension includes a sidebar panel that displays:
    - Select compiled WASM file
    - Select network
    - Select source account
+   - Choose deployment signing method
 
 Stellar Suite will:
 
 - Run build and deployment using the official CLI
+- Run signing workflow before deployment submission
 - Capture the deployed contract ID
 - Display results inside VS Code
 - Save deployment metadata for later use
+
+### Deployment Signing Workflow
+
+Deployment now includes a signing phase before transaction submission. Supported methods:
+
+- Interactive signing (prompt for secret key)
+- Keypair file signing
+- Stored keypair signing from VS Code secure storage
+- Hardware wallet signature verification (external sign + paste signature)
+- Source-account delegated signing via Stellar CLI
+
+For hardware wallet signing, Stellar Suite copies the payload hash to clipboard and validates the returned signature before deploy.
+For local keypair signing and signature verification, install `@stellar/stellar-sdk` in the extension development environment.
 
 ### Building a Contract
 
@@ -225,6 +244,18 @@ RPC endpoint URL for transaction simulation when not using local CLI.
 
 Use local Stellar CLI instead of RPC endpoint.
 
+### `stellarSuite.signing.defaultMethod`
+
+Default signing method used when deployment signing begins.
+
+### `stellarSuite.signing.requireValidatedSignature`
+
+Require a validated signature before deployment is submitted.
+
+### `stellarSuite.signing.enableSecureKeyStorage`
+
+Allow saving keypairs in VS Code SecretStorage for reuse.
+
 **Example:**
 
 ```json
@@ -233,7 +264,10 @@ Use local Stellar CLI instead of RPC endpoint.
   "stellarSuite.cliPath": "stellar",
   "stellarSuite.source": "dev",
   "stellarSuite.rpcUrl": "https://soroban-testnet.stellar.org:443",
-  "stellarSuite.useLocalCli": true
+  "stellarSuite.useLocalCli": true,
+  "stellarSuite.signing.defaultMethod": "interactive",
+  "stellarSuite.signing.requireValidatedSignature": true,
+  "stellarSuite.signing.enableSecureKeyStorage": true
 }
 ```
 
@@ -258,6 +292,7 @@ Stellar Suite is being developed in stages.
 
 - Run contract simulations before invoking transactions
 - Display execution results in a readable interface
+- Show storage state diff (created/modified/deleted entries)
 - Show authorization requirements
 - Display resource usage metrics
 

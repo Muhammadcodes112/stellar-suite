@@ -1,5 +1,6 @@
 import { execFile, exec } from 'child_process';
 import { promisify } from 'util';
+import { StateDiff, StateSnapshot } from '../types/simulationState';
 import {
     CliErrorContext,
     CliErrorType,
@@ -15,7 +16,7 @@ import * as path from 'path';
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
 
-function getEnvironmentWithPath(): NodeJS.ProcessEnv {
+function getEnvironmentWithPath(customEnv?: Record<string, string>): NodeJS.ProcessEnv {
     const env = { ...process.env };
     const homeDir = os.homedir();
     const cargoBin = path.join(homeDir, '.cargo', 'bin');
@@ -32,6 +33,10 @@ function getEnvironmentWithPath(): NodeJS.ProcessEnv {
     env.PATH = [...additionalPaths, currentPath].filter(Boolean).join(path.delimiter);
     env.Path = env.PATH;
 
+    // Merge custom environment variables (profile overrides)
+    if (customEnv) {
+        Object.assign(env, customEnv);
+    }
     return env;
 }
 
@@ -50,11 +55,16 @@ export interface SimulationResult {
         memoryBytes?: number;
     };
     validationWarnings?: string[];
+    rawResult?: unknown;
+    stateSnapshotBefore?: StateSnapshot;
+    stateSnapshotAfter?: StateSnapshot;
+    stateDiff?: StateDiff;
 }
 
 export class SorobanCliService {
     private cliPath: string;
     private source: string;
+    private customEnv: Record<string, string> = {};
 
     constructor(cliPath: string, source: string = 'dev') {
         this.cliPath = cliPath;
@@ -103,8 +113,8 @@ export class SorobanCliService {
                 }
             }
 
-            // Get environment with proper PATH
-            const env = getEnvironmentWithPath();
+            // Get environment with proper PATH + custom env vars
+            const env = getEnvironmentWithPath(this.customEnv);
 
             // Execute the command using execFile with proper argument array
             // This avoids shell injection and properly handles arguments
@@ -143,6 +153,7 @@ export class SorobanCliService {
                     return {
                         success: true,
                         result: parsed.result || parsed.returnValue || parsed,
+                        rawResult: parsed,
                         resourceUsage: parsed.resource_usage || parsed.resourceUsage || parsed.cpu_instructions ? {
                             cpuInstructions: parsed.cpu_instructions,
                             memoryBytes: parsed.memory_bytes
@@ -156,6 +167,7 @@ export class SorobanCliService {
                         return {
                             success: true,
                             result: parsed.result || parsed.returnValue || parsed,
+                            rawResult: parsed,
                             resourceUsage: parsed.resource_usage || parsed.resourceUsage || parsed.cpu_instructions ? {
                                 cpuInstructions: parsed.cpu_instructions,
                                 memoryBytes: parsed.memory_bytes
@@ -166,14 +178,16 @@ export class SorobanCliService {
                     // If no JSON found, return raw output (CLI may output plain text)
                     return {
                         success: true,
-                        result: output
+                        result: output,
+                        rawResult: output,
                     };
                 }
             } catch (parseError) {
                 // If parsing fails, return raw output
                 return {
                     success: true,
-                    result: stdout.trim()
+                    result: stdout.trim(),
+                    rawResult: stdout.trim(),
                 };
             }
         } catch (error) {
@@ -233,7 +247,7 @@ export class SorobanCliService {
      */
     async isAvailable(): Promise<boolean> {
         try {
-            const env = getEnvironmentWithPath();
+            const env = getEnvironmentWithPath(this.customEnv);
             await execFileAsync(this.cliPath, ['--version'], { env: env, timeout: 5000 });
             return true;
         } catch {
@@ -282,5 +296,15 @@ export class SorobanCliService {
      */
     setSource(source: string): void {
         this.source = source;
+    }
+
+    /**
+     * Set custom environment variables for CLI execution.
+     * These are merged into the process environment on every call.
+     *
+     * @param env - Key–value pairs to inject
+     */
+    setCustomEnv(env: Record<string, string>): void {
+        this.customEnv = { ...env };
     }
 }

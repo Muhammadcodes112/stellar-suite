@@ -5,6 +5,8 @@
 // capabilities for simulation history.
 // ============================================================
 
+import { StateDiff, StateSnapshot } from '../types/simulationState';
+
 // ── Public types ──────────────────────────────────────────────
 
 /** Outcome status of a simulation run. */
@@ -89,6 +91,12 @@ export interface SimulationHistoryEntry {
     durationMs?: number;
     /** Optional user-provided label or note. */
     label?: string;
+    /** Captured storage snapshot before simulation execution. */
+    stateSnapshotBefore?: StateSnapshot;
+    /** Captured storage snapshot after simulation execution. */
+    stateSnapshotAfter?: StateSnapshot;
+    /** Computed storage-level state diff for this simulation. */
+    stateDiff?: StateDiff;
 }
 
 // ── Minimal VS Code-compatible interfaces ────────────────────
@@ -102,7 +110,7 @@ interface SimpleOutputChannel {
 
 interface SimpleWorkspaceState {
     get<T>(key: string, defaultValue: T): T;
-    update(key: string, value: unknown): Thenable<void>;
+    update(key: string, value: unknown): PromiseLike<void>;
 }
 
 interface SimpleExtensionContext {
@@ -161,6 +169,9 @@ export class SimulationHistoryService {
             method: params.method,
             durationMs: params.durationMs,
             label: params.label,
+            stateSnapshotBefore: params.stateSnapshotBefore,
+            stateSnapshotAfter: params.stateSnapshotAfter,
+            stateDiff: params.stateDiff,
         };
 
         const entries = this.loadEntries();
