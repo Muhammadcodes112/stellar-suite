@@ -11,6 +11,7 @@ import {
 } from '../utils/cliErrorParser';
 import * as os from 'os';
 import * as path from 'path';
+import { CliHistoryService } from './cliHistoryService';
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
@@ -19,7 +20,7 @@ function getEnvironmentWithPath(): NodeJS.ProcessEnv {
     const env = { ...process.env };
     const homeDir = os.homedir();
     const cargoBin = path.join(homeDir, '.cargo', 'bin');
-    
+
     const additionalPaths = [
         cargoBin,
         path.join(homeDir, '.local', 'bin'),
@@ -27,11 +28,11 @@ function getEnvironmentWithPath(): NodeJS.ProcessEnv {
         '/opt/homebrew/bin',
         '/opt/homebrew/sbin'
     ];
-    
+
     const currentPath = env.PATH || env.Path || '';
     env.PATH = [...additionalPaths, currentPath].filter(Boolean).join(path.delimiter);
     env.Path = env.PATH;
-    
+
     return env;
 }
 
@@ -49,23 +50,37 @@ export interface SimulationResult {
         cpuInstructions?: number;
         memoryBytes?: number;
     };
+    validationWarnings?: string[];
 }
 
 export class SorobanCliService {
     private cliPath: string;
     private source: string;
+    private historyService?: CliHistoryService;
 
-    constructor(cliPath: string, source: string = 'dev') {
+    constructor(
+        cliPath: string,
+        source: string = 'dev',
+        historyService?: CliHistoryService
+    ) {
         this.cliPath = cliPath;
         this.source = source;
+        this.historyService = historyService;
     }
 
     async simulateTransaction(
         contractId: string,
         functionName: string,
         args: any[],
-        network: string = 'testnet'
+        network: string = 'testnet',
+        historySource: 'manual' | 'replay' | null = 'manual'
     ): Promise<SimulationResult> {
+        const startTime = Date.now();
+        let stdoutText = '';
+        let stderrText = '';
+        let exitCode = 0;
+        let success = false;
+
         try {
             const commandParts = [
                 this.cliPath,
@@ -104,7 +119,7 @@ export class SorobanCliService {
 
             // Get environment with proper PATH
             const env = getEnvironmentWithPath();
-            
+
             // Execute the command using execFile with proper argument array
             // This avoids shell injection and properly handles arguments
             const { stdout, stderr } = await execFileAsync(
@@ -115,6 +130,21 @@ export class SorobanCliService {
                     maxBuffer: 10 * 1024 * 1024, // 10MB buffer
                     timeout: 30000 // 30 second timeout
                 }
+            );
+
+            stdoutText = stdout;
+            stderrText = stderr;
+            success = true;
+
+            await this.recordExecution(
+                commandParts[0],
+                commandParts.slice(1),
+                true,
+                0,
+                stdoutText,
+                stderrText,
+                Date.now() - startTime,
+                historySource
             );
 
             if (stderr && stderr.trim().length > 0) {
@@ -135,7 +165,7 @@ export class SorobanCliService {
             // The official CLI outputs structured data, often in JSON format
             try {
                 const output = stdout.trim();
-                
+
                 // Try to parse as JSON first (CLI may output pure JSON)
                 try {
                     const parsed = JSON.parse(output);
@@ -184,8 +214,11 @@ export class SorobanCliService {
                 network,
             };
 
-            const stderrText = this.getExecErrorStream(error, 'stderr');
-            const stdoutText = this.getExecErrorStream(error, 'stdout');
+            stderrText = this.getExecErrorStream(error, 'stderr');
+            stdoutText = this.getExecErrorStream(error, 'stdout');
+            exitCode = (error as any)?.code ?? 1;
+            success = false;
+
             const combined = [stderrText, stdoutText, errorMessage].filter(Boolean).join('\n');
 
             const parsedError = parseCliErrorOutput(combined || errorMessage, cliContext);
@@ -198,8 +231,50 @@ export class SorobanCliService {
                 ];
             }
 
+            await this.recordExecution(
+                this.cliPath,
+                [
+                    'contract', 'invoke',
+                    '--id', contractId,
+                    '--source', this.source,
+                    '--network', network,
+                    '--', functionName,
+                    ...args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a))
+                ],
+                false,
+                exitCode,
+                stdoutText,
+                stderrText,
+                Date.now() - startTime,
+                historySource
+            );
+
             logCliError(parsedError, '[Simulation CLI]');
             return this.toSimulationError(parsedError);
+        }
+    }
+
+    private async recordExecution(
+        command: string,
+        args: string[],
+        success: boolean,
+        exitCode: number,
+        stdout: string,
+        stderr: string,
+        durationMs: number,
+        source: 'manual' | 'replay' | null
+    ): Promise<void> {
+        if (this.historyService && source) {
+            await this.historyService.recordCommand({
+                command,
+                args,
+                outcome: success ? 'success' : 'failure',
+                exitCode,
+                stdout,
+                stderr,
+                durationMs,
+                source
+            });
         }
     }
 

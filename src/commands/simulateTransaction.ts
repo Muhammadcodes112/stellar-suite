@@ -10,13 +10,15 @@ import { formatError } from '../utils/errorFormatter';
 import { resolveCliConfigurationForCommand } from '../services/cliConfigurationVscode';
 import { SimulationValidationService } from '../services/simulationValidationService';
 
+import { SimulationHistoryService } from '../services/simulationHistoryService';
+import { CliHistoryService } from '../services/cliHistoryService';
+
 export async function simulateTransaction(
     context: vscode.ExtensionContext,
-    sidebarProvider?: SidebarViewProvider
+    sidebarProvider?: SidebarViewProvider,
+    historyService?: SimulationHistoryService,
+    cliHistoryService?: CliHistoryService
 ) {
-import { SimulationHistoryService } from '../services/simulationHistoryService';
-
-export async function simulateTransaction(context: vscode.ExtensionContext, sidebarProvider?: SidebarViewProvider, historyService?: SimulationHistoryService) {
     try {
         const resolvedCliConfig = await resolveCliConfigurationForCommand(context);
         if (!resolvedCliConfig.validation.valid) {
@@ -100,8 +102,7 @@ export async function simulateTransaction(context: vscode.ExtensionContext, side
                 }
             } catch (error) {
                 vscode.window.showErrorMessage(
-                    `Invalid JSON: ${
-                        error instanceof Error ? error.message : 'Unknown error'
+                    `Invalid JSON: ${error instanceof Error ? error.message : 'Unknown error'
                     }`
                 );
                 return;
@@ -182,7 +183,7 @@ export async function simulateTransaction(context: vscode.ExtensionContext, side
                 title: 'Simulating Soroban Transaction',
                 cancellable: false
             },
-            async progress => {
+            async (progress: vscode.Progress<{ message?: string; increment?: number }>) => {
                 progress.report({ increment: 0, message: 'Initializing...' });
 
                 let result;
@@ -193,7 +194,7 @@ export async function simulateTransaction(context: vscode.ExtensionContext, side
                     progress.report({ increment: 30, message: 'Using Stellar CLI...' });
 
                     let actualCliPath = cliPath;
-                    let cliService = new SorobanCliService(actualCliPath, source);
+                    let cliService = new SorobanCliService(actualCliPath, source, cliHistoryService);
 
                     try {
                         progress.report({ increment: 50, message: 'Executing simulation...' });
