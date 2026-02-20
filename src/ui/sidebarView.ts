@@ -1,4 +1,3 @@
-
 // ============================================================
 // src/ui/sidebarView.ts
 // WebviewView provider — context menu + drag-and-drop reordering.
@@ -33,6 +32,8 @@ import {
     ExistingContract,
 } from '../services/sidebarImportService';
 import { ImportSelection, ImportPreview } from '../types/sidebarExport';
+import { ContractDependencyDetectionService, DependencyGraph } from '../services/contractDependencyDetectionService';
+import { ContractMetadataService } from '../services/contractMetadataService';
 import { CliHistoryService, CliHistoryEntry } from '../services/cliHistoryService';
 import { CliReplayService } from '../services/cliReplayService';
 
@@ -71,6 +72,18 @@ export interface ContractInfo {
     templateConfidence?: number;
     /** Pattern evidence used for this classification. */
     templateMatchedPatterns?: string[];
+    /** Direct dependencies (contracts this one depends on). */
+    dependencies?: string[];
+    /** Dependents (contracts that depend on this one). */
+    dependents?: string[];
+    /** Number of direct dependencies. */
+    dependencyCount?: number;
+    /** Number of dependents. */
+    dependentCount?: number;
+    /** Dependency depth in the graph. */
+    dependencyDepth?: number;
+    /** Whether this contract is part of a circular dependency. */
+    hasCircularDependency?: boolean;
 }
 
 export interface DeploymentRecord {
@@ -96,6 +109,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
     private readonly versionTracker: ContractVersionTracker;
     private readonly templateService: ContractTemplateService;
     private _simulationHistoryService?: SimulationHistoryService;
+    private readonly dependencyService: ContractDependencyDetectionService;
+    private dependencyGraph: DependencyGraph | null = null;
 
     // Cache the last-discovered list so drag messages can reference it
     private _lastContracts: ContractInfo[] = [];
@@ -119,6 +134,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             this._context,
             this.outputChannel
         );
+        this.dependencyService = new ContractDependencyDetectionService(this.outputChannel);
         this.templateService = new ContractTemplateService(this.outputChannel);
     }
 
@@ -361,7 +377,6 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                             ? { type: 'success', message: 'Simulation entry deleted.' }
                             : { type: 'error', message: 'Entry not found.' },
                     });
-                    // Refresh the history panel
                     if (deleted) {
                         const refreshedEntries = historyService.queryHistory({ limit: 50 });
                         const refreshedStats = historyService.getStatistics();
@@ -608,17 +623,29 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         this.refresh();
     }
 
-    public refresh() {
+    public async refresh() {
         if (!this._view) { return; }
         this.outputChannel.appendLine('[Sidebar] Refreshing contract data…');
 
         const discovered = this._discoverContracts();
         const ordered = this.reorderingService.applyOrder(discovered);
+
+        // Build dependency graph
+        await this._enrichWithDependencyInfo(ordered);
+
         this._lastContracts = ordered;
 
         const deployments = this._getDeploymentHistory();
         const versionStates = this._getVersionStates(ordered);
-        this._view.webview.postMessage({ type: 'update', contracts: ordered, deployments, versionStates });
+
+        // FIX: Removed duplicate postMessage call; keeping the one with dependencyGraph
+        this._view.webview.postMessage({
+            type: 'update',
+            contracts: ordered,
+            deployments,
+            versionStates,
+            dependencyGraph: this.dependencyGraph ? this._serializeDependencyGraph() : null
+        });
         this.refreshHistory();
     }
 
@@ -645,7 +672,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         this.refresh();
     }
 
-    // ── Contract discovery ────────────────────────────────────
+    // ── Contract discovery ────────────────────────────────────────
 
     private _discoverContracts(): ContractInfo[] {
         const workspaceFolders = vscode.workspace.workspaceFolders;
@@ -740,6 +767,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     {}
                 );
 
+                // FIX: Removed duplicate manualTemplateId key; keeping the one that uses manualTemplateAssignments
                 const templateResult = this.templateService.detectTemplate({
                     cargoTomlPath: cargoPath,
                     contractDir: rootPath,
@@ -793,7 +821,6 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
     }
 
     private _getSimulationHistoryService(): SimulationHistoryService | undefined {
-        // Lazily create a SimulationHistoryService scoped to the workspace
         if (!this._simulationHistoryService) {
             this._simulationHistoryService = new SimulationHistoryService(
                 this._context,
@@ -803,637 +830,741 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         return this._simulationHistoryService;
     }
 
+    /**
+     * Enrich contract info with dependency data
+     */
+    private async _enrichWithDependencyInfo(contracts: ContractInfo[]): Promise<void> {
+        try {
+            const metadataService = new ContractMetadataService(
+                vscode.workspace as any,
+                this.outputChannel
+            );
+            const scan = await metadataService.scanWorkspace();
+
+            if (scan.contracts.length === 0) {
+                return;
+            }
+
+            this.dependencyGraph = await this.dependencyService.buildDependencyGraph(scan.contracts, {
+                detectImports: true,
+                includeDevDependencies: false,
+                includeBuildDependencies: true,
+            });
+
+            for (const contract of contracts) {
+                const contractMeta = scan.contracts.find(c => c.cargoTomlPath === contract.path);
+                if (!contractMeta) {
+                    continue;
+                }
+
+                const node = Array.from(this.dependencyGraph.nodes.values()).find(
+                    n => n.name === contractMeta.contractName
+                );
+
+                if (node) {
+                    contract.dependencies = node.dependencies;
+                    contract.dependents = node.dependents;
+                    contract.dependencyCount = node.dependencyCount;
+                    contract.dependentCount = node.dependentCount;
+                    contract.dependencyDepth = node.depth;
+                    contract.hasCircularDependency = this.dependencyGraph.cycles.some(cycle =>
+                        cycle.some(path => path.includes(contractMeta.contractName))
+                    );
+                }
+            }
+        } catch (error) {
+            this.outputChannel.appendLine(`[Sidebar] Failed to build dependency graph: ${error}`);
+        }
+    }
+
+    /**
+     * Serialize dependency graph for webview
+     */
+    private _serializeDependencyGraph(): any {
+        if (!this.dependencyGraph) {
+            return null;
+        }
+
+        return {
+            nodes: Array.from(this.dependencyGraph.nodes.values()).map(node => ({
+                name: node.name,
+                dependencies: node.dependencies,
+                dependents: node.dependents,
+                dependencyCount: node.dependencyCount,
+                dependentCount: node.dependentCount,
+                depth: node.depth,
+                isExternal: node.isExternal,
+            })),
+            edges: this.dependencyGraph.edges.map(edge => ({
+                from: edge.from,
+                to: edge.to,
+                reason: edge.reason,
+                dependencyName: edge.dependencyName,
+                source: edge.source,
+                isExternal: edge.isExternal,
+            })),
+            cycles: this.dependencyGraph.cycles,
+            deploymentOrder: this.dependencyGraph.deploymentOrder,
+            deploymentLevels: this.dependencyGraph.deploymentLevels,
+            statistics: this.dependencyGraph.statistics,
+        };
+    }
+
     // ── HTML ──────────────────────────────────────────────────
 
     private _getHtmlForWebview(_webview: vscode.Webview): string {
-        return /* html */`< !DOCTYPE html >
-    <html lang="en" >
-        <head>
-        <meta charset="UTF-8" >
-            <meta name="viewport" content = "width=device-width, initial-scale=1.0" >
-                <meta http - equiv="Content-Security-Policy" content = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';" >
-                    <title>Stellar Suite </title>
-                        <style>
-                        /* ── Reset & Variables ──────────────────────────────────── */
-                        * { box- sizing: border - box; margin: 0; padding: 0; }
+        return /* html */`<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+    <title>Stellar Suite</title>
+    <style>
+        /* ── Reset & Variables ──────────────────────────────────── */
+        * { box-sizing: border-box; margin: 0; padding: 0; }
 
-:root {
-    --color - bg: var(--vscode - sideBar - background);
-    --color - fg: var(--vscode - foreground);
-    --color - muted: var(--vscode - descriptionForeground);
-    --color - accent: var(--vscode - textLink - foreground);
-    --color - border: var(--vscode - panel - border);
-    --color - card: var(--vscode - editor - background);
-    --color - card - hover: var(--vscode - list - hoverBackground);
-    --color - btn - bg: var(--vscode - button - background);
-    --color - btn - fg: var(--vscode - button - foreground);
-    --color - btn - hover: var(--vscode - button - hoverBackground);
-    --color - danger: var(--vscode - errorForeground, #f14c4c);
-    --color - success:      #3fb950;
-    --color - accent - dim: rgba(88, 166, 255, 0.15);
-    --radius: 6px;
-    --shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
-}
+        :root {
+            --color-bg: var(--vscode-sideBar-background);
+            --color-fg: var(--vscode-foreground);
+            --color-muted: var(--vscode-descriptionForeground);
+            --color-accent: var(--vscode-textLink-foreground);
+            --color-border: var(--vscode-panel-border);
+            --color-card: var(--vscode-editor-background);
+            --color-card-hover: var(--vscode-list-hoverBackground);
+            --color-btn-bg: var(--vscode-button-background);
+            --color-btn-fg: var(--vscode-button-foreground);
+            --color-btn-hover: var(--vscode-button-hoverBackground);
+            --color-danger: var(--vscode-errorForeground, #f14c4c);
+            --color-success: #3fb950;
+            --color-accent-dim: rgba(88, 166, 255, 0.15);
+            --radius: 6px;
+            --shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+        }
 
-body {
-    font - family: var(--vscode - font - family);
-    font - size: var(--vscode - font - size, 13px);
-    color: var(--color - fg);
-    background: var(--color - bg);
-    padding: 0;
-    user - select: none;
-}
+        body {
+            font-family: var(--vscode-font-family);
+            font-size: var(--vscode-font-size, 13px);
+            color: var(--color-fg);
+            background: var(--color-bg);
+            padding: 0;
+            user-select: none;
+        }
 
-/* ── Header ─────────────────────────────────────────────── */
-.header {
-    display: flex;
-    align - items: center;
-    justify - content: space - between;
-    padding: 12px 14px 8px;
-    gap: 6px;
-}
-.header h1 {
-    font - size: 13px;
-    font - weight: 700;
-    letter - spacing: 0.5px;
-    flex: 1;
-}
-.header - actions { display: flex; gap: 4px; }
-.icon - btn {
-    background: transparent;
-    border: none;
-    cursor: pointer;
-    color: var(--color - muted);
-    padding: 4px 6px;
-    border - radius: 4px;
-    font - size: 12px;
-    white - space: nowrap;
-}
-.icon - btn:hover { color: var(--color - fg); background: var(--color - card - hover); }
+        /* ── Header ─────────────────────────────────────────────── */
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 14px 8px;
+            gap: 6px;
+        }
+        .header h1 {
+            font-size: 13px;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            flex: 1;
+        }
+        .header-actions { display: flex; gap: 4px; }
+        .icon-btn {
+            background: transparent;
+            border: none;
+            cursor: pointer;
+            color: var(--color-muted);
+            padding: 4px 6px;
+            border-radius: 4px;
+            font-size: 12px;
+            white-space: nowrap;
+        }
+        .icon-btn:hover { color: var(--color-fg); background: var(--color-card-hover); }
 
-/* ── Section headings ───────────────────────────────────── */
-.section - label {
-    font - size: 11px;
-    font - weight: 700;
-    letter - spacing: 0.8px;
-    text - transform: uppercase;
-    color: var(--color - muted);
-    padding: 8px 14px 4px;
-}
+        /* ── Section headings ───────────────────────────────────── */
+        .section-label {
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.8px;
+            text-transform: uppercase;
+            color: var(--color-muted);
+            padding: 8px 14px 4px;
+        }
 
-/* ── Contract cards ─────────────────────────────────────── */
-#contracts - list { padding: 0 8px 8px; }
+        /* ── Contract cards ─────────────────────────────────────── */
+        #contracts-list { padding: 0 8px 8px; }
 
-.contract - card {
-    background: var(--color - card);
-    border: 1px solid var(--color - border);
-    border - radius: var(--radius);
-    padding: 10px 12px;
-    margin - bottom: 6px;
-    cursor: grab;
-    transition: border - color 0.15s, background 0.15s, opacity 0.15s, transform 0.15s;
-    position: relative;
-}
-.contract-card:hover  { border-color: var(--color-accent); background: var(--color-card-hover); }
-.contract-card:focus  {
-    outline:      2px solid var(--vscode-focusBorder);
-    border-color: var(--color-accent);
-    background:   var(--color-card-hover);
-}
-.contract-card:active { cursor: grabbing; }
+        .contract-card {
+            background: var(--color-card);
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius);
+            padding: 10px 12px;
+            margin-bottom: 6px;
+            cursor: grab;
+            transition: border-color 0.15s, background 0.15s, opacity 0.15s, transform 0.15s;
+            position: relative;
+        }
+        .contract-card:hover  { border-color: var(--color-accent); background: var(--color-card-hover); }
+        .contract-card:focus  {
+            outline:      2px solid var(--vscode-focusBorder);
+            border-color: var(--color-accent);
+            background:   var(--color-card-hover);
+        }
+        .contract-card:active { cursor: grabbing; }
 
-/* ── Shortcut hints ──────────────────────────────────────── */
-.shortcut-hints {
-    display:     none;
-    flex-wrap:   wrap;
-    gap:         6px;
-    margin-top:  6px;
-    font-size:   10px;
-    color:       var(--color-muted);
-}
-.shortcut-hints.visible { display: flex; }
-.shortcut-hint kbd {
-    display:        inline-block;
-    background:     rgba(255,255,255,.08);
-    border:         1px solid var(--color-border);
-    border-radius:  3px;
-    padding:        0 4px;
-    font-family:    inherit;
-    font-size:      10px;
-    line-height:    1.6;
-    margin-right:   2px;
-}
+        /* ── Shortcut hints ──────────────────────────────────────── */
+        .shortcut-hints {
+            display:     none;
+            flex-wrap:   wrap;
+            gap:         6px;
+            margin-top:  6px;
+            font-size:   10px;
+            color:       var(--color-muted);
+        }
+        .shortcut-hints.visible { display: flex; }
+        .shortcut-hint kbd {
+            display:        inline-block;
+            background:     rgba(255,255,255,.08);
+            border:         1px solid var(--color-border);
+            border-radius:  3px;
+            padding:        0 4px;
+            font-family:    inherit;
+            font-size:      10px;
+            line-height:    1.6;
+            margin-right:   2px;
+        }
 
-/* ── Screen reader only ──────────────────────────────────── */
-.sr-only {
-    position:   absolute;
-    width:      1px;
-    height:     1px;
-    padding:    0;
-    margin:     -1px;
-    overflow:   hidden;
-    clip:       rect(0,0,0,0);
-    white-space: nowrap;
-    border:     0;
-}
+        /* ── Screen reader only ──────────────────────────────────── */
+        .sr-only {
+            position:   absolute;
+            width:      1px;
+            height:     1px;
+            padding:    0;
+            margin:     -1px;
+            overflow:   hidden;
+            clip:       rect(0,0,0,0);
+            white-space: nowrap;
+            border:     0;
+        }
 
-.contract-card.pinned::before {
-    content:       '';
-    position:      absolute;
-    top: 0; left: 0;
-    width: 3px;
-    height: 100 %;
-    background: var(--color - accent);
-    border - radius: var(--radius) 0 0 var(--radius);
-}
+        .contract-card.pinned::before {
+            content:       '';
+            position:      absolute;
+            top: 0; left: 0;
+            width: 3px;
+            height: 100%;
+            background: var(--color-accent);
+            border-radius: var(--radius) 0 0 var(--radius);
+        }
 
-/* ── Drag states ─────────────────────────────────────────── */
-.contract - card.dragging {
-    opacity: 0.4;
-    transform: scale(0.98);
-    cursor: grabbing;
-    border - style: dashed;
-}
-.contract - card.drop - target - above::before {
-    content: '';
-    position: absolute;
-    top: -4px;
-    left: 0; right: 0;
-    height: 3px;
-    background: var(--color - accent);
-    border - radius: 2px;
-    width: 100 %;
-    z - index: 10;
-}
-.contract - card.drop - target - below::after {
-    content: '';
-    position: absolute;
-    bottom: -4px;
-    left: 0; right: 0;
-    height: 3px;
-    background: var(--color - accent);
-    border - radius: 2px;
-    z - index: 10;
-}
+        /* ── Drag states ─────────────────────────────────────────── */
+        .contract-card.dragging {
+            opacity: 0.4;
+            transform: scale(0.98);
+            cursor: grabbing;
+            border-style: dashed;
+        }
+        .contract-card.drop-target-above::before {
+            content: '';
+            position: absolute;
+            top: -4px;
+            left: 0; right: 0;
+            height: 3px;
+            background: var(--color-accent);
+            border-radius: 2px;
+            width: 100%;
+            z-index: 10;
+        }
+        .contract-card.drop-target-below::after {
+            content: '';
+            position: absolute;
+            bottom: -4px;
+            left: 0; right: 0;
+            height: 3px;
+            background: var(--color-accent);
+            border-radius: 2px;
+            z-index: 10;
+        }
 
-.drag - handle {
-    display: flex;
-    align - items: center;
-    color: var(--color - muted);
-    padding - right: 8px;
-    opacity: 0;
-    transition:    opacity 0.1s;
-    flex - shrink: 0;
-    font - size: 14px;
-    cursor: grab;
-    line - height: 1;
-}
-.contract - card: hover.drag - handle          { opacity: 1; }
-.contract - card.pinned.drag - handle         { opacity: 0.3; cursor: not - allowed; }
+        .drag-handle {
+            display: flex;
+            align-items: center;
+            color: var(--color-muted);
+            padding-right: 8px;
+            opacity: 0;
+            transition:    opacity 0.1s;
+            flex-shrink: 0;
+            font-size: 14px;
+            cursor: grab;
+            line-height: 1;
+        }
+        .contract-card:hover .drag-handle          { opacity: 1; }
+        .contract-card.pinned .drag-handle         { opacity: 0.3; cursor: not-allowed; }
 
-/* ── Card layout ─────────────────────────────────────────── */
-.card - header {
-    display: flex;
-    align - items: center;
-    gap: 6px;
-    margin - bottom: 6px;
-}
-.contract - name {
-    font - weight: 600;
-    color: var(--color - accent);
-    flex: 1;
-    overflow: hidden;
-    text - overflow: ellipsis;
-    white - space: nowrap;
-}
+        /* ── Card layout ─────────────────────────────────────────── */
+        .card-header {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 6px;
+        }
+        .contract-name {
+            font-weight: 600;
+            color: var(--color-accent);
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
 
-.badge {
-    font - size: 10px;
-    font - weight: 600;
-    padding: 1px 6px;
-    border - radius: 10px;
-    white - space: nowrap;
-}
-.badge - deployed  { background: rgba(63, 185, 80, .2); color: var(--color - success); border: 1px solid rgba(63, 185, 80, .4); }
-.badge - built     { background: var(--color - accent - dim); color: var(--color - accent); border: 1px solid rgba(88, 166, 255, .3); }
-.badge - not - built { background: rgba(255, 255, 255, .05); color: var(--color - muted); border: 1px solid var(--color - border); }
-.badge - version   { background: rgba(180, 120, 255, .15); color: #b478ff; border: 1px solid rgba(180, 120, 255, .35); }
-.badge - mismatch  { background: rgba(241, 76, 76, .15); color: var(--color - danger); border: 1px solid rgba(241, 76, 76, .4); }
-.badge - template - token   { background: rgba(60, 170, 255, .16); color: #6ec3ff; border: 1px solid rgba(60, 170, 255, .35); }
-.badge - template - escrow  { background: rgba(255, 164, 66, .14); color: #ffb86a; border: 1px solid rgba(255, 164, 66, .34); }
-.badge - template - voting  { background: rgba(100, 195, 110, .15); color: #72d67d; border: 1px solid rgba(100, 195, 110, .34); }
-.badge - template - custom  { background: rgba(187, 134, 252, .14); color: #c59bff; border: 1px solid rgba(187, 134, 252, .36); }
-.badge - template - unknown { background: rgba(255, 255, 255, .05); color: var(--color - muted); border: 1px solid var(--color - border); }
+        /* ── FIX: Removed duplicate .badge / .badge-* block — keeping this correct one ── */
+        .badge {
+            font-size:     10px;
+            font-weight:   600;
+            padding:       1px 6px;
+            border-radius: 10px;
+            white-space:   nowrap;
+        }
+        .badge-deployed  { background: rgba(63,185,80,.2);      color: var(--color-success); border: 1px solid rgba(63,185,80,.4); }
+        .badge-built     { background: var(--color-accent-dim); color: var(--color-accent);  border: 1px solid rgba(88,166,255,.3); }
+        .badge-not-built { background: rgba(255,255,255,.05);   color: var(--color-muted);   border: 1px solid var(--color-border); }
+        .badge-version   { background: rgba(180,120,255,.15);   color: #b478ff;              border: 1px solid rgba(180,120,255,.35); }
+        .badge-mismatch  { background: rgba(241,76,76,.15);     color: var(--color-danger);  border: 1px solid rgba(241,76,76,.4); }
+        .badge-template-token   { background: rgba(60, 170, 255, .16); color: #6ec3ff; border: 1px solid rgba(60, 170, 255, .35); }
+        .badge-template-escrow  { background: rgba(255, 164, 66, .14); color: #ffb86a; border: 1px solid rgba(255, 164, 66, .34); }
+        .badge-template-voting  { background: rgba(100, 195, 110, .15); color: #72d67d; border: 1px solid rgba(100, 195, 110, .34); }
+        .badge-template-custom  { background: rgba(187, 134, 252, .14); color: #c59bff; border: 1px solid rgba(187, 134, 252, .36); }
+        .badge-template-unknown { background: rgba(255,255,255,.05); color: var(--color-muted); border: 1px solid var(--color-border); }
 
-.contract - meta {
-    font - size: 11px;
-    color: var(--color - muted);
-    margin - bottom: 8px;
-    line - height: 1.5;
-}
-.contract - id {
-    font - family: monospace;
-    font - size: 10px;
-    color: var(--color - muted);
-    word -break: break-all;
-    margin - bottom: 6px;
-    background: rgba(255, 255, 255, .04);
-    padding: 3px 5px;
-    border - radius: 3px;
-}
+        /* ── Dependency info ─────────────────────────────────────── */
+        .dependency-info {
+            display:      flex;
+            flex-wrap:    wrap;
+            gap:          4px;
+            margin-top:   6px;
+            margin-bottom: 8px;
+        }
+        .dep-badge {
+            background:   rgba(100, 150, 255, .12);
+            color:        #88b4ff;
+            border:       1px solid rgba(100, 150, 255, .3);
+            padding:      2px 6px;
+            border-radius: 8px;
+            white-space:  nowrap;
+            font-size:    9px;
+            font-weight:  500;
+        }
+        .dep-circular {
+            background:   rgba(241, 76, 76, .15);
+            color:        var(--color-danger);
+            border:       1px solid rgba(241, 76, 76, .4);
+            font-weight:  600;
+        }
 
-.card - actions { display: flex; gap: 5px; flex - wrap: wrap; }
-.action - btn {
-    background: var(--color - btn - bg);
-    color: var(--color - btn - fg);
-    border: none;
-    border - radius: 4px;
-    padding: 4px 10px;
-    font - size: 11px;
-    font - weight: 500;
-    cursor: pointer;
-    transition:    background 0.15s;
-}
-.action - btn:hover    { background: var(--color - btn - hover); }
-.action - btn:disabled { opacity: 0.4; cursor: not - allowed; }
-.action - btn.secondary {
-    background: transparent;
-    border: 1px solid var(--color - border);
-    color: var(--color - fg);
-}
-.action - btn.secondary:hover { background: var(--color - card - hover); }
+        .contract-meta {
+            font-size:     11px;
+            color:         var(--color-muted);
+            margin-bottom: 8px;
+            line-height:   1.5;
+        }
+        .contract-id {
+            font-family:   monospace;
+            font-size:     10px;
+            color:         var(--color-muted);
+            word-break:    break-all;
+            margin-bottom: 6px;
+            background:    rgba(255,255,255,.04);
+            padding:       3px 5px;
+            border-radius: 3px;
+        }
 
-/* ── Context Menu ───────────────────────────────────────── */
-#context - menu {
-    position: fixed;
-    background: var(--vscode - menu - background, var(--color - card));
-    border: 1px solid var(--vscode - menu - border, var(--color - border));
-    border - radius: var(--radius);
-    box - shadow: var(--shadow);
-    min - width: 200px;
-    max - width: 260px;
-    z - index: 1000;
-    overflow: hidden;
-    padding: 4px 0;
-    display: none;
-    animation:     menuIn 0.08s ease;
-}
-@keyframes menuIn {
-    from { opacity: 0; transform: scale(0.96) translateY(-4px); }
-    to   { opacity: 1; transform: scale(1)    translateY(0); }
-}
-#context - menu.visible { display: block; }
+        .card-actions { display: flex; gap: 5px; flex-wrap: wrap; }
+        .action-btn {
+            background:    var(--color-btn-bg);
+            color:         var(--color-btn-fg);
+            border:        none;
+            border-radius: 4px;
+            padding:       4px 10px;
+            font-size:     11px;
+            font-weight:   500;
+            cursor:        pointer;
+            transition:    background 0.15s;
+        }
+        .action-btn:hover    { background: var(--color-btn-hover); }
+        .action-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .action-btn.secondary {
+            background: transparent;
+            border: 1px solid var(--color-border);
+            color: var(--color-fg);
+        }
+        .action-btn.secondary:hover { background: var(--color-card-hover); }
 
-.menu - item {
-    display: flex;
-    align - items: center;
-    gap: 8px;
-    padding: 6px 12px;
-    cursor: pointer;
-    font - size: 13px;
-    color: var(--vscode - menu - foreground, var(--color - fg));
-    white - space: nowrap;
-}
-.menu - item:hover             { background: var(--vscode - menu - selectionBackground, var(--color - card - hover)); }
-.menu - item.disabled          { opacity: 0.4; cursor: not - allowed; pointer - events: none; }
-.menu - item.destructive       { color: var(--color - danger); }
-.menu - item.destructive:hover { background: rgba(241, 76, 76, .12); }
-.menu - item.item - icon        { font - size: 14px; width: 16px; text - align: center; flex - shrink: 0; }
-.menu - item.item - label       { flex: 1; }
-.menu - item.item - shortcut    { font - size: 11px; color: var(--color - muted); margin - left: 8px; }
-.menu - separator              { height: 1px; background: var(--color - border); margin: 3px 0; }
+        /* ── Context Menu ───────────────────────────────────────── */
+        #context-menu {
+            position: fixed;
+            background: var(--vscode-menu-background, var(--color-card));
+            border: 1px solid var(--vscode-menu-border, var(--color-border));
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+            min-width: 200px;
+            max-width: 260px;
+            z-index: 1000;
+            overflow: hidden;
+            padding: 4px 0;
+            display: none;
+            animation:     menuIn 0.08s ease;
+        }
+        @keyframes menuIn {
+            from { opacity: 0; transform: scale(0.96) translateY(-4px); }
+            to   { opacity: 1; transform: scale(1)    translateY(0); }
+        }
+        #context-menu.visible { display: block; }
 
-/* ── Toast ──────────────────────────────────────────────── */
-#toast - container {
-    position: fixed;
-    bottom: 16px;
-    left: 50 %;
-    transform: translateX(-50 %);
-    z - index: 2000;
-    display: flex;
-    flex - direction: column;
-    gap: 6px;
-    pointer - events: none;
-}
-.toast {
-    background: var(--color - card);
-    border: 1px solid var(--color - border);
-    border - radius: var(--radius);
-    padding: 8px 14px;
-    font - size: 12px;
-    display: flex;
-    align - items: center;
-    gap: 8px;
-    box - shadow: var(--shadow);
-    animation:     toastIn 0.2s ease;
-    white - space: nowrap;
-}
-@keyframes toastIn {
-    from { opacity: 0; transform: translateY(8px); }
-    to   { opacity: 1; transform: translateY(0); }
-}
-.toast.success { border - left: 3px solid var(--color - success); }
-.toast.error   { border - left: 3px solid var(--color - danger); }
-.toast.info    { border - left: 3px solid var(--color - accent); }
+        .menu-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 12px;
+            cursor: pointer;
+            font-size: 13px;
+            color: var(--vscode-menu-foreground, var(--color-fg));
+            white-space: nowrap;
+        }
+        .menu-item:hover             { background: var(--vscode-menu-selectionBackground, var(--color-card-hover)); }
+        .menu-item.disabled          { opacity: 0.4; cursor: not-allowed; pointer-events: none; }
+        .menu-item.destructive       { color: var(--color-danger); }
+        .menu-item.destructive:hover { background: rgba(241, 76, 76, .12); }
+        .menu-item .item-icon        { font-size: 14px; width: 16px; text-align: center; flex-shrink: 0; }
+        .menu-item .item-label       { flex: 1; }
+        .menu-item .item-shortcut    { font-size: 11px; color: var(--color-muted); margin-left: 8px; }
+        .menu-separator              { height: 1px; background: var(--color-border); margin: 3px 0; }
 
-/* ── Import Preview Modal ──────────────────────────────────── */
-#import - modal - overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.55);
-    z - index: 3000;
-    display: none;
-    align - items: center;
-    justify - content: center;
-}
-#import - modal - overlay.visible { display: flex; }
+        /* ── Toast ──────────────────────────────────────────────── */
+        #toast-container {
+            position: fixed;
+            bottom: 16px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 2000;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            pointer-events: none;
+        }
+        .toast {
+            background: var(--color-card);
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius);
+            padding: 8px 14px;
+            font-size: 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            box-shadow: var(--shadow);
+            animation:     toastIn 0.2s ease;
+            white-space: nowrap;
+        }
+        @keyframes toastIn {
+            from { opacity: 0; transform: translateY(8px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+        .toast.success { border-left: 3px solid var(--color-success); }
+        .toast.error   { border-left: 3px solid var(--color-danger); }
+        .toast.info    { border-left: 3px solid var(--color-accent); }
 
-#import - modal {
-    background: var(--color - card);
-    border: 1px solid var(--color - border);
-    border - radius: 8px;
-    box - shadow: var(--shadow);
-    width: 320px;
-    max - height: 90vh;
-    display: flex;
-    flex - direction: column;
-    overflow: hidden;
-    animation:     menuIn 0.12s ease;
-}
-.import -modal - header {
-    display: flex;
-    align - items: center;
-    justify - content: space - between;
-    padding: 10px 14px;
-    border - bottom: 1px solid var(--color - border);
-    font - weight: 700;
-    font - size: 13px;
-}
-.import -modal - body {
-    flex: 1;
-    overflow - y: auto;
-    padding: 10px 14px;
-    font - size: 12px;
-}
-.import -modal - footer {
-    display: flex;
-    justify - content: flex - end;
-    gap: 8px;
-    padding: 10px 14px;
-    border - top: 1px solid var(--color - border);
-}
-.import -section { margin - bottom: 10px; }
-.import -section - title {
-    font - weight: 700;
-    font - size: 11px;
-    color: var(--color - muted);
-    text - transform: uppercase;
-    letter - spacing: 0.5px;
-    margin - bottom: 4px;
-}
-.import -item {
-    display: flex;
-    align - items: center;
-    gap: 6px;
-    padding: 4px 0;
-    font - size: 12px;
-}
-.import -item label { flex: 1; cursor: pointer; }
-.import -item select {
-    font - size: 11px;
-    background: var(--color - bg);
-    color: var(--color - fg);
-    border: 1px solid var(--color - border);
-    border - radius: 4px;
-    padding: 2px 4px;
-}
-.import -stat {
-    display: flex;
-    justify - content: space - between;
-    padding: 2px 0;
-    color: var(--color - muted);
-}
-.import -stat.val { color: var(--color - fg); font - weight: 600; }
-.import -error - box {
-    background: rgba(241, 76, 76, .1);
-    border: 1px solid rgba(241, 76, 76, .4);
-    border - radius: var(--radius);
-    padding: 6px 10px;
-    font - size: 11px;
-    color: var(--color - danger);
-    margin - bottom: 8px;
-}
-.import -warning - box {
-    background: rgba(255, 200, 50, .1);
-    border: 1px solid rgba(255, 200, 50, .4);
-    border - radius: var(--radius);
-    padding: 6px 10px;
-    font - size: 11px;
-    color: #d4a017;
-    margin - bottom: 8px;
-}
+        /* ── Import Preview Modal ──────────────────────────────────── */
+        #import-modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.55);
+            z-index: 3000;
+            display: none;
+            align-items: center;
+            justify-content: center;
+        }
+        #import-modal-overlay.visible { display: flex; }
 
-/* ── Version history panel ──────────────────────────────── */
-#version - panel {
-    position: fixed;
-    top: 0; right: 0; bottom: 0;
-    width: 280px;
-    background: var(--color - card);
-    border - left: 1px solid var(--color - border);
-    box - shadow: var(--shadow);
-    z - index: 900;
-    display: none;
-    flex - direction: column;
-    overflow: hidden;
-}
-#version - panel.visible { display: flex; }
-.version - panel - header {
-    display: flex;
-    align - items: center;
-    justify - content: space - between;
-    padding: 10px 12px;
-    background: var(--color - bg);
-    border - bottom: 1px solid var(--color - border);
-    font - size: 12px;
-    font - weight: 700;
-}
-.version - panel - body { flex: 1; overflow - y: auto; padding: 8px; }
-.version - entry {
-    background: var(--color - bg);
-    border: 1px solid var(--color - border);
-    border - radius: var(--radius);
-    padding: 7px 10px;
-    margin - bottom: 5px;
-    font - size: 11px;
-}
-.version - entry - ver  { font - weight: 700; color: var(--color - accent); margin - bottom: 2px; }
-.version - entry - meta { color: var(--color - muted); margin - bottom: 3px; }
-.version - entry - tag  { font - size: 10px; color: #b478ff; margin - bottom: 3px; }
-.version - entry.deployed { border - left: 3px solid var(--color - success); }
-.version - mismatch - banner {
-    background: rgba(241, 76, 76, .1);
-    border: 1px solid rgba(241, 76, 76, .4);
-    border - radius: var(--radius);
-    padding: 6px 10px;
-    font - size: 11px;
-    color: var(--color - danger);
-    margin - bottom: 8px;
-}
+        #import-modal {
+            background: var(--color-card);
+            border: 1px solid var(--color-border);
+            border-radius: 8px;
+            box-shadow: var(--shadow);
+            width: 320px;
+            max-height: 90vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            animation:     menuIn 0.12s ease;
+        }
+        .import-modal-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 14px;
+            border-bottom: 1px solid var(--color-border);
+            font-weight: 700;
+            font-size: 13px;
+        }
+        .import-modal-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px 14px;
+            font-size: 12px;
+        }
+        .import-modal-footer {
+            display: flex;
+            justify-content: flex-end;
+            gap: 8px;
+            padding: 10px 14px;
+            border-top: 1px solid var(--color-border);
+        }
+        .import-section { margin-bottom: 10px; }
+        .import-section-title {
+            font-weight: 700;
+            font-size: 11px;
+            color: var(--color-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 4px;
+        }
+        .import-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 0;
+            font-size: 12px;
+        }
+        .import-item label { flex: 1; cursor: pointer; }
+        .import-item select {
+            font-size: 11px;
+            background: var(--color-bg);
+            color: var(--color-fg);
+            border: 1px solid var(--color-border);
+            border-radius: 4px;
+            padding: 2px 4px;
+        }
+        .import-stat {
+            display: flex;
+            justify-content: space-between;
+            padding: 2px 0;
+            color: var(--color-muted);
+        }
+        .import-stat .val { color: var(--color-fg); font-weight: 600; }
+        .import-error-box {
+            background: rgba(241, 76, 76, .1);
+            border: 1px solid rgba(241, 76, 76, .4);
+            border-radius: var(--radius);
+            padding: 6px 10px;
+            font-size: 11px;
+            color: var(--color-danger);
+            margin-bottom: 8px;
+        }
+        .import-warning-box {
+            background: rgba(255, 200, 50, .1);
+            border: 1px solid rgba(255, 200, 50, .4);
+            border-radius: var(--radius);
+            padding: 6px 10px;
+            font-size: 11px;
+            color: #d4a017;
+            margin-bottom: 8px;
+        }
 
-/* ── Deployments ────────────────────────────────────────── */
-#deployments - list { padding: 0 8px 16px; }
-.deployment - card {
-    background: var(--color - card);
-    border: 1px solid var(--color - border);
-    border - radius: var(--radius);
-    padding: 8px 12px;
-    margin - bottom: 5px;
-    font - size: 12px;
-}
-.deployment - id   { font - family: monospace; font - size: 10px; color: var(--color - muted); word -break: break-all; }
-.deployment - meta { color: var(--color - muted); margin - top: 2px; }
+        /* ── Version history panel ──────────────────────────────── */
+        #version-panel {
+            position: fixed;
+            top: 0; right: 0; bottom: 0;
+            width: 280px;
+            background: var(--color-card);
+            border-left: 1px solid var(--color-border);
+            box-shadow: var(--shadow);
+            z-index: 900;
+            display: none;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        #version-panel.visible { display: flex; }
+        .version-panel-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 12px;
+            background: var(--color-bg);
+            border-bottom: 1px solid var(--color-border);
+            font-size: 12px;
+            font-weight: 700;
+        }
+        .version-panel-body { flex: 1; overflow-y: auto; padding: 8px; }
+        .version-entry {
+            background: var(--color-bg);
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius);
+            padding: 7px 10px;
+            margin-bottom: 5px;
+            font-size: 11px;
+        }
+        .version-entry-ver  { font-weight: 700; color: var(--color-accent); margin-bottom: 2px; }
+        .version-entry-meta { color: var(--color-muted); margin-bottom: 3px; }
+        .version-entry-tag  { font-size: 10px; color: #b478ff; margin-bottom: 3px; }
+        .version-entry.deployed { border-left: 3px solid var(--color-success); }
+        .version-mismatch-banner {
+            background: rgba(241, 76, 76, .1);
+            border: 1px solid rgba(241, 76, 76, .4);
+            border-radius: var(--radius);
+            padding: 6px 10px;
+            font-size: 11px;
+            color: var(--color-danger);
+            margin-bottom: 8px;
+        }
 
-/* ── Empty state ────────────────────────────────────────── */
-.empty - state {
-    text - align: center;
-    padding: 28px 16px;
-    color: var(--color - muted);
-    font - size: 12px;
-    line - height: 1.6;
-}
-.empty - state.emoji { font - size: 28px; margin - bottom: 8px; }
+        /* ── Deployments ────────────────────────────────────────── */
+        #deployments-list { padding: 0 8px 16px; }
+        .deployment-card {
+            background: var(--color-card);
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius);
+            padding: 8px 12px;
+            margin-bottom: 5px;
+            font-size: 12px;
+        }
+        .deployment-id   { font-family: monospace; font-size: 10px; color: var(--color-muted); word-break: break-all; }
+        .deployment-meta { color: var(--color-muted); margin-top: 2px; }
 
-/* ── Simulation History ────────────────────────────────── */
-#sim - history - list { padding: 0 8px 16px; }
-.sim - history - stats {
-    font - size: 11px;
-    color: var(--color - muted);
-    padding: 4px 14px 6px;
-    display: flex;
-    gap: 10px;
-    flex - wrap: wrap;
-}
-.sim - history - stats.stat - value { font - weight: 600; color: var(--color - fg); }
-.sim - history - card {
-    background: var(--color - card);
-    border: 1px solid var(--color - border);
-    border - radius: var(--radius);
-    padding: 8px 12px;
-    margin - bottom: 5px;
-    font - size: 12px;
-    transition: border - color 0.15s;
-}
-.sim - history - card:hover { border - color: var(--color - accent); }
-.sim - history - card.success { border - left: 3px solid var(--color - success); }
-.sim - history - card.failure { border - left: 3px solid var(--color - danger); }
-.sim - history - fn   { font - weight: 600; color: var(--color - accent); }
-.sim - history - meta { font - size: 10px; color: var(--color - muted); margin - top: 2px; }
-.sim - history - label { font - size: 10px; color: #b478ff; margin - top: 2px; }
-.sim - history - error { font - size: 10px; color: var(--color - danger); margin - top: 2px; overflow: hidden; text - overflow: ellipsis; white - space: nowrap; max - width: 100 %; }
-.sim - history - actions { display: flex; gap: 4px; margin - top: 5px; }
-.sim - history - filter {
-    padding: 4px 8px;
-    display: flex;
-    gap: 4px;
-    align - items: center;
-}
-.sim - history - filter input {
-    background: var(--color - card);
-    border: 1px solid var(--color - border);
-    border - radius: 3px;
-    color: var(--color - fg);
-    font - size: 11px;
-    padding: 3px 6px;
-    flex: 1;
-    outline: none;
-    font - family: inherit;
-}
-.sim - history - filter input:focus { border - color: var(--color - accent); }
-.sim - history - filter select {
-    background: var(--color - card);
-    border: 1px solid var(--color - border);
-    border - radius: 3px;
-    color: var(--color - fg);
-    font - size: 11px;
-    padding: 3px 4px;
-    outline: none;
-    font - family: inherit;
-}
-/* ── CLI History ────────────────────────────────────────── */
-#cli-history-list { padding: 0 8px 16px; }
-.cli-history-card {
-    background: var(--color-card);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius);
-    padding: 8px 12px;
-    margin-bottom: 5px;
-    font-size: 12px;
-    transition: border-color 0.15s;
-}
-.cli-history-card:hover { border-color: var(--color-accent); }
-.cli-history-card.success { border-left: 3px solid var(--color-success); }
-.cli-history-card.failure { border-left: 3px solid var(--color-danger); }
-.cli-history-cmd   { font-family: monospace; font-weight: 600; color: var(--color-accent); word-break: break-all; margin-bottom: 4px; }
-.cli-history-meta { font-size: 10px; color: var(--color-muted); margin-top: 2px; }
-.cli-history-label { font-size: 10px; color: #b478ff; margin-top: 2px; }
-.cli-history-output {
-    font-family: monospace;
-    font-size: 9px;
-    background: rgba(0, 0, 0, 0.2);
-    padding: 4px;
-    border-radius: 3px;
-    margin-top: 6px;
-    max-height: 60px;
-    overflow-y: auto;
-    white-space: pre-wrap;
-    border: 1px solid var(--color-border);
-}
+        /* ── Empty state ────────────────────────────────────────── */
+        .empty-state {
+            text-align: center;
+            padding: 28px 16px;
+            color: var(--color-muted);
+            font-size: 12px;
+            line-height: 1.6;
+        }
+        .empty-state .emoji { font-size: 28px; margin-bottom: 8px; }
 
+        /* ── Simulation History ────────────────────────────────── */
+        #sim-history-list { padding: 0 8px 16px; }
+        .sim-history-stats {
+            font-size: 11px;
+            color: var(--color-muted);
+            padding: 4px 14px 6px;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .sim-history-stats .stat-value { font-weight: 600; color: var(--color-fg); }
+        .sim-history-card {
+            background: var(--color-card);
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius);
+            padding: 8px 12px;
+            margin-bottom: 5px;
+            font-size: 12px;
+            transition: border-color 0.15s;
+        }
+        .sim-history-card:hover { border-color: var(--color-accent); }
+        .sim-history-card.success { border-left: 3px solid var(--color-success); }
+        .sim-history-card.failure { border-left: 3px solid var(--color-danger); }
+        .sim-history-fn   { font-weight: 600; color: var(--color-accent); }
+        .sim-history-meta { font-size: 10px; color: var(--color-muted); margin-top: 2px; }
+        .sim-history-label { font-size: 10px; color: #b478ff; margin-top: 2px; }
+        .sim-history-error { font-size: 10px; color: var(--color-danger); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+        .sim-history-actions { display: flex; gap: 4px; margin-top: 5px; }
+        .sim-history-filter {
+            padding: 4px 8px;
+            display: flex;
+            gap: 4px;
+            align-items: center;
+        }
+        .sim-history-filter input {
+            background: var(--color-card);
+            border: 1px solid var(--color-border);
+            border-radius: 3px;
+            color: var(--color-fg);
+            font-size: 11px;
+            padding: 3px 6px;
+            flex: 1;
+            outline: none;
+            font-family: inherit;
+        }
+        .sim-history-filter input:focus { border-color: var(--color-accent); }
+        .sim-history-filter select {
+            background: var(--color-card);
+            border: 1px solid var(--color-border);
+            border-radius: 3px;
+            color: var(--color-fg);
+            font-size: 11px;
+            padding: 3px 4px;
+            outline: none;
+            font-family: inherit;
+        }
 
+        /* ── CLI History ────────────────────────────────────────── */
+        #cli-history-list { padding: 0 8px 16px; }
+        .cli-history-card {
+            background: var(--color-card);
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius);
+            padding: 8px 12px;
+            margin-bottom: 5px;
+            font-size: 12px;
+            transition: border-color 0.15s;
+        }
+        .cli-history-card:hover { border-color: var(--color-accent); }
+        .cli-history-card.success { border-left: 3px solid var(--color-success); }
+        .cli-history-card.failure { border-left: 3px solid var(--color-danger); }
+        .cli-history-cmd   { font-family: monospace; font-weight: 600; color: var(--color-accent); word-break: break-all; margin-bottom: 4px; }
+        .cli-history-meta { font-size: 10px; color: var(--color-muted); margin-top: 2px; }
+        .cli-history-label { font-size: 10px; color: #b478ff; margin-top: 2px; }
+        .cli-history-output {
+            font-family: monospace;
+            font-size: 9px;
+            background: rgba(0, 0, 0, 0.2);
+            padding: 4px;
+            border-radius: 3px;
+            margin-top: 6px;
+            max-height: 60px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            border: 1px solid var(--color-border);
+        }
+        .cli-history-actions { display: flex; gap: 4px; margin-top: 6px; }
 
-/* ── Filter Bar (Shared) ────────────────────────────────── */
-.filter-bar {
-    padding:       4px 8px 8px 8px;
-    display:       flex;
-    gap:           4px;
-    align-items:   center;
-    flex-wrap:     wrap;
-}
-.filter-bar input.filter-search {
-    background:    var(--color-card);
-    border:        1px solid var(--color-border);
-    border-radius: 3px;
-    color:         var(--color-fg);
-    font-size:     11px;
-    padding:       4px 6px;
-    flex:          1;
-    min-width:     120px;
-    outline:       none;
-    font-family:   inherit;
-}
-.filter-bar input.filter-search:focus { border-color: var(--color-accent); }
-.filter-bar select.filter-select {
-    background:    var(--color-card);
-    border:        1px solid var(--color-border);
-    border-radius: 3px;
-    color:         var(--color-fg);
-    font-size:     11px;
-    padding:       3px 4px;
-    outline:       none;
-    font-family:   inherit;
-}
-.contract-name mark {
-    background-color: var(--color-accent-dim);
-    color: var(--color-accent);
-    border-radius: 2px;
-}
-.cli-history-actions { display: flex; gap: 4px; margin-top: 6px; }
-</style>
-    </head>
-    < body >
-    
-    
-<<!-- ── Header ─────────────────────────────────────────────── -->
+        /* ── Filter Bar (Shared) ────────────────────────────────── */
+        .filter-bar {
+            padding:       4px 8px 8px 8px;
+            display:       flex;
+            gap:           4px;
+            align-items:   center;
+            flex-wrap:     wrap;
+        }
+        .filter-bar input.filter-search {
+            background:    var(--color-card);
+            border:        1px solid var(--color-border);
+            border-radius: 3px;
+            color:         var(--color-fg);
+            font-size:     11px;
+            padding:       4px 6px;
+            flex:          1;
+            min-width:     120px;
+            outline:       none;
+            font-family:   inherit;
+        }
+        .filter-bar input.filter-search:focus { border-color: var(--color-accent); }
+        .filter-bar select.filter-select {
+            background:    var(--color-card);
+            border:        1px solid var(--color-border);
+            border-radius: 3px;
+            color:         var(--color-fg);
+            font-size:     11px;
+            padding:       3px 4px;
+            outline:       none;
+            font-family:   inherit;
+        }
+        .contract-name mark {
+            background-color: var(--color-accent-dim);
+            color: var(--color-accent);
+            border-radius: 2px;
+        }
+    </style>
+</head>
+<body>
+
+<!-- ── Header ─────────────────────────────────────────────── -->
 <div class="header">
     <h1>Stellar Suite</h1>
     <div class="header-actions">
@@ -1476,62 +1607,61 @@ body {
     </div>
 </div>
 
+<!-- ── Deployments section ───────────────────────────────── -->
+<div class="section-label">Deployments</div>
+<div id="deployments-list">
+    <div class="empty-state" style="padding:12px 16px">No deployments recorded.</div>
+</div>
 
-                                                                                    < !-- ── Deployments section ───────────────────────────────── -->
-                                                                                        <div class="section-label" > Deployments </div>
-                                                                                            < div id = "deployments-list" >
-                                                                                                <div class="empty-state" style = "padding:12px 16px" > No deployments recorded.</div>
-                                                                                                    </div>
+<!-- ── CLI History section ──────────────────────── -->
+<div class="section-label" style="display:flex;align-items:center;justify-content:space-between;padding-right:14px">
+    CLI History
+    <span style="display:flex;gap:4px">
+        <button class="icon-btn" id="cli-history-load-btn" title="Refresh history" style="font-size:11px;padding:2px 5px">↻</button>
+        <button class="icon-btn" id="cli-history-export-btn" title="Export history" style="font-size:11px;padding:2px 5px">⤓</button>
+        <button class="icon-btn" id="cli-history-clear-btn" title="Clear history" style="font-size:11px;padding:2px 5px;color:var(--color-danger)">✕</button>
+    </span>
+</div>
+<div id="cli-history-list">
+    <div class="empty-state" style="padding:12px 16px">No history records found.</div>
+</div>
 
-                                                                                                    <!-- ── CLI History section ──────────────────────── -->
-                                                                                                    <div class="section-label" style="display:flex;align-items:center;justify-content:space-between;padding-right:14px">
-                                                                                                        CLI History
-                                                                                                        <span style="display:flex;gap:4px">
-                                                                                                            <button class="icon-btn" id="cli-history-load-btn" title="Refresh history" style="font-size:11px;padding:2px 5px">↻</button>
-                                                                                                            <button class="icon-btn" id="cli-history-export-btn" title="Export history" style="font-size:11px;padding:2px 5px">⤓</button>
-                                                                                                            <button class="icon-btn" id="cli-history-clear-btn" title="Clear history" style="font-size:11px;padding:2px 5px;color:var(--color-danger)">✕</button>
-                                                                                                        </span>
-                                                                                                    </div>
-                                                                                                    <div id="cli-history-list">
-                                                                                                        <div class="empty-state" style="padding:12px 16px">No history records found.</div>
-                                                                                                    </div>
+<!-- ── Simulation History section ──────────────────────── -->
+<div class="section-label" style="display:flex;align-items:center;justify-content:space-between;padding-right:14px">
+    Simulations
+    <span style="display:flex;gap:4px">
+        <button class="icon-btn" id="sim-history-load-btn" title="Refresh simulations" style="font-size:11px;padding:2px 5px">↻</button>
+        <button class="icon-btn" id="sim-history-export-btn" title="Export simulations" style="font-size:11px;padding:2px 5px">⤓</button>
+        <button class="icon-btn" id="sim-history-clear-btn" title="Clear simulations" style="font-size:11px;padding:2px 5px;color:var(--color-danger)">✕</button>
+    </span>
+</div>
+<div class="sim-history-filter" id="sim-history-filter">
+    <input type="text" id="sim-history-search" placeholder="Search simulations…" />
+    <select id="sim-history-outcome-filter">
+        <option value="">All</option>
+        <option value="success">Success</option>
+        <option value="failure">Failure</option>
+    </select>
+</div>
+<div id="sim-history-stats-bar" class="sim-history-stats"></div>
+<div id="sim-history-list">
+    <div class="empty-state" style="padding:12px 16px">Click ↻ to load simulation history.</div>
+</div>
 
-                                                                                                    < !-- ── Simulation History section ──────────────────────── -->
-                                                                                                        <div class="section-label" style = "display:flex;align-items:center;justify-content:space-between;padding-right:14px" >
-                                                                                                            Simulations
-                                                                                                            < span style = "display:flex;gap:4px" >
-                                                                                                                <button class="icon-btn" id = "sim-history-load-btn" title = "Refresh simulations" style = "font-size:11px;padding:2px 5px" >↻</button>
-                                                                                                                    < button class="icon-btn" id = "sim-history-export-btn" title = "Export simulations" style = "font-size:11px;padding:2px 5px" >⤓</button>
-                                                                                                                        < button class="icon-btn" id = "sim-history-clear-btn" title = "Clear simulations" style = "font-size:11px;padding:2px 5px;color:var(--color-danger)" >✕</button>
-                                                                                                                            </span>
-                                                                                                                            </div>
-                                                                                            < div class="sim-history-filter" id = "sim-history-filter" >
-                                                                                                <input type="text" id = "sim-history-search" placeholder = "Search simulations…" />
-                                                                                                    <select id="sim-history-outcome-filter" >
-                                                                                                        <option value="" > All </option>
-                                                                                                            < option value = "success" > Success </option>
-                                                                                                                < option value = "failure" > Failure </option>
-                                                                                                                    </select>
-                                                                                                                    </div>
-                                                                                                                    < div id = "sim-history-stats-bar" class="sim-history-stats" > </div>
-                                                                                                                        < div id = "sim-history-list" >
-                                                                                                                            <div class="empty-state" style = "padding:12px 16px" > Click ↻ to load simulation history.</div>
-                                                                                                                                </div>
+<!-- ── Version History Panel ────────────────────────────── -->
+<div id="version-panel" role="complementary" aria-label="Version history">
+    <div class="version-panel-header">
+        <span id="version-panel-title">Version History</span>
+        <button class="icon-btn" onclick="hideVersionPanel()" title="Close">✕</button>
+    </div>
+    <div class="version-panel-body" id="version-panel-body"></div>
+</div>
 
-                                                                                                                                < !-- ── Version History Panel ────────────────────────────── -->
-                                                                                                                                    <div id="version-panel" role = "complementary" aria - label="Version history" >
-                                                                                                                                        <div class="version-panel-header" >
-                                                                                                                                            <span id="version-panel-title" > Version History </span>
-                                                                                                                                                < button class="icon-btn" onclick = "hideVersionPanel()" title = "Close" >✕</button>
-                                                                                                                                                    </div>
-                                                                                                                                                    < div class="version-panel-body" id = "version-panel-body" > </div>
-                                                                                                                                                        </div>
+<!-- ── Context Menu ──────────────────────────────────────── -->
+<div id="context-menu" role="menu" aria-label="Contract options"></div>
 
-                                                                                                                                                        < !-- ── Context Menu ──────────────────────────────────────── -->
-                                                                                                                                                            <div id="context-menu" role = "menu" aria - label="Contract options" > </div>
-
-                                                                                                                                                                < !-- ── Toast Container ──────────────────────────────────── -->
-                                                                                                                                                                    <div id="toast-container" aria - live="polite" > </div>
+<!-- ── Toast Container ──────────────────────────────────── -->
+<div id="toast-container" aria-live="polite"></div>
 
 <!-- ── Import Preview Modal ────────────────────────────────── -->
 <div id="import-modal-overlay">
@@ -1754,7 +1884,6 @@ function focusContract(index) {
     const cards = getContractCards();
     if (cards.length === 0) { return; }
     index = Math.max(0, Math.min(index, cards.length - 1));
-    // Clear previous selection
     cards.forEach(c => c.setAttribute('aria-selected', 'false'));
     _focusedContractIndex = index;
     const card = cards[index];
@@ -1788,13 +1917,11 @@ function cardToContract(card) {
 document.addEventListener('keydown', (e) => {
     const tag = (e.target && e.target.tagName) || '';
 
-    // Always allow Escape from inputs
     if (e.key === 'Escape') {
         if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') {
             e.target.blur();
             return;
         }
-        // Priority: modal > menu > drag > focus
         const importModal = document.getElementById('import-modal-overlay');
         if (importModal && importModal.classList.contains('visible')) {
             hideImportModal();
@@ -1809,7 +1936,6 @@ document.addEventListener('keydown', (e) => {
             cancelDrag();
             return;
         }
-        // Clear keyboard focus
         if (_focusedContractIndex >= 0) {
             const cards = getContractCards();
             cards.forEach(c => c.setAttribute('aria-selected', 'false'));
@@ -1821,14 +1947,11 @@ document.addEventListener('keydown', (e) => {
         return;
     }
 
-    // Skip all shortcuts when in form inputs (except Escape handled above)
     if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') { return; }
 
-    // Skip navigation when menu or modal is visible
     const menuVisible = document.getElementById('context-menu')?.classList.contains('visible');
     const modalVisible = document.getElementById('import-modal-overlay')?.classList.contains('visible');
 
-    // Focus search
     if (e.key === '/' || (e.ctrlKey && e.key === 'f') || (e.metaKey && e.key === 'f')) {
         if (!menuVisible && !modalVisible) {
             e.preventDefault();
@@ -1843,7 +1966,6 @@ document.addEventListener('keydown', (e) => {
     const cards = getContractCards();
     const hasModifier = e.ctrlKey || e.metaKey || e.altKey;
 
-    // Arrow / j/k navigation
     if (e.key === 'ArrowDown' || (!hasModifier && e.key === 'j')) {
         e.preventDefault();
         if (_focusedContractIndex < 0) { focusContract(0); }
@@ -1867,11 +1989,9 @@ document.addEventListener('keydown', (e) => {
         return;
     }
 
-    // Actions on focused card
     const focused = getFocusedCard();
     if (!focused) { return; }
 
-    // Enter / Space / Shift+F10 — open context menu
     if (e.key === 'Enter' || e.key === ' ' || (e.shiftKey && e.key === 'F10')) {
         e.preventDefault();
         const contract = cardToContract(focused);
@@ -1888,7 +2008,6 @@ document.addEventListener('keydown', (e) => {
         return;
     }
 
-    // F2 — rename
     if (e.key === 'F2') {
         e.preventDefault();
         _activeMenuContract = cardToContract(focused);
@@ -1896,7 +2015,6 @@ document.addEventListener('keydown', (e) => {
         return;
     }
 
-    // Delete — remove
     if (e.key === 'Delete') {
         e.preventDefault();
         _activeMenuContract = cardToContract(focused);
@@ -1904,7 +2022,6 @@ document.addEventListener('keydown', (e) => {
         return;
     }
 
-    // Single-letter shortcuts (no modifiers)
     if (!hasModifier && !e.shiftKey) {
         const letter = e.key.toUpperCase();
         if (letter === 'B') { e.preventDefault(); sendAction('build', focused); return; }
@@ -1927,7 +2044,6 @@ document.addEventListener('click', (e) => {
 });
 
 // ── Render contracts ──────────────────────────────────────────
-// ── Render contracts ──────────────────────────────────────────
 function templateBadgeClass(contract) {
     if (!contract || !contract.templateCategory) { return 'badge badge-template-unknown'; }
     const category = String(contract.templateCategory).toLowerCase();
@@ -1945,35 +2061,34 @@ function templateActionTitle(contract) {
     return 'Open template-specific actions';
 }
 
-// Ensure highlighting doesn't break HTML parsing
 function highlightMatch(text, query) {
     if (!query) return esc(text);
     const textLower = text.toLowerCase();
     const queryLower = query.toLowerCase();
     const idx = textLower.indexOf(queryLower);
     if (idx === -1) return esc(text);
-    
+
     const before = text.substring(0, idx);
     const match = text.substring(idx, idx + query.length);
     const after = text.substring(idx + query.length);
-    
+
     return \`\${esc(before)}<mark>\${esc(match)}</mark>\${esc(after)}\`;
 }
 
 function updateTemplateDropdown() {
     const filterEl = document.getElementById('contract-template-filter');
     const prevValue = filterEl.value;
-    
+
     const categories = new Set(_contracts.map(c => c.templateCategory || 'unknown'));
     const sorted = Array.from(categories).sort();
-    
+
     let html = '<option value="">Any Template</option>';
     for (const cat of sorted) {
         const catStr = String(cat);
         const name = catStr.charAt(0).toUpperCase() + catStr.slice(1);
         html += \`<option value="\${esc(catStr)}">\${esc(name)}</option>\`;
     }
-    
+
     filterEl.innerHTML = html;
     if (categories.has(prevValue)) {
         filterEl.value = prevValue;
@@ -1989,28 +2104,18 @@ function saveFilters() {
 }
 
 function applyContractFiltersAndSearch() {
-    let result = _contracts.filter(c => {
-        // Build filter
+    return _contracts.filter(c => {
         if (_filters.build === 'built' && !c.isBuilt) return false;
         if (_filters.build === 'not-built' && c.isBuilt) return false;
-        
-        // Deploy filter
         if (_filters.deploy === 'deployed' && !c.contractId) return false;
         if (_filters.deploy === 'not-deployed' && c.contractId) return false;
-        
-        // Template filter
         if (_filters.template && (c.templateCategory || 'unknown') !== _filters.template) return false;
-        
-        // Search filter
         if (_filters.search) {
             const query = _filters.search.toLowerCase();
             if (!c.name.toLowerCase().includes(query)) return false;
         }
-        
         return true;
     });
-    
-    return result;
 }
 
 function initFilters() {
@@ -2020,7 +2125,6 @@ function initFilters() {
     const templateSel = document.getElementById('contract-template-filter');
     const resetBtn = document.getElementById('contract-filter-reset-btn');
 
-    // Restore from state
     if (searchInp) searchInp.value = _filters.search || '';
     if (buildSel) buildSel.value = _filters.build || '';
     if (deploySel) deploySel.value = _filters.deploy || '';
@@ -2066,7 +2170,6 @@ function initFilters() {
         updateResetBtn();
     });
 
-    // In case there were saved active filters on load, set up UI
     updateResetBtn();
 }
 
@@ -2085,7 +2188,7 @@ function renderContracts(contracts, totalCount = contracts.length) {
         </div>\`;
         return;
     }
-    
+
     if (totalCount > 0 && contracts.length === 0) {
         el.innerHTML = \`<div class="empty-state">
             <div class="emoji">🔍</div>
@@ -2138,6 +2241,15 @@ function renderContracts(contracts, totalCount = contracts.length) {
             \${c.deployedVersion ? \`<div class="contract-meta" style="font-size:10px">Deployed version: <strong>v\${esc(c.deployedVersion)}</strong></div>\` : ''}
             \${c.hasVersionMismatch ? \`<div class="contract-meta" style="color:var(--color-danger);font-size:10px">⚠ \${esc(c.versionMismatchMessage || 'Version mismatch')}</div>\` : ''}
 
+            \${c.dependencyCount !== undefined || c.dependentCount !== undefined ? \`
+                <div class="dependency-info">
+                    \${c.dependencyCount > 0 ? \`<span class="dep-badge" title="Dependencies">📦 \${c.dependencyCount} dep\${c.dependencyCount !== 1 ? 's' : ''}</span>\` : ''}
+                    \${c.dependentCount > 0 ? \`<span class="dep-badge" title="Dependents">⬆️ \${c.dependentCount} used by</span>\` : ''}
+                    \${c.dependencyDepth !== undefined ? \`<span class="dep-badge" title="Dependency depth">🔗 depth \${c.dependencyDepth}</span>\` : ''}
+                    \${c.hasCircularDependency ? \`<span class="dep-badge dep-circular" title="Circular dependency detected">⚠️ circular</span>\` : ''}
+                </div>
+            \` : ''}
+
             <div class="card-actions">
                 <button class="action-btn"
                         onclick="sendAction('build', this.closest('.contract-card'))"
@@ -2169,7 +2281,6 @@ function renderContracts(contracts, totalCount = contracts.length) {
         </div>
     \`}).join('');
 
-    // Restore focus after re-render
     if (_focusedContractIndex >= 0) {
         const cards = getContractCards();
         if (cards.length > 0) {
@@ -2183,9 +2294,7 @@ function renderContracts(contracts, totalCount = contracts.length) {
     }
 }
 
-// Initialize filters immediately
 setTimeout(initFilters, 0);
-
 
 function sendAction(actionId, card) {
     vscode.postMessage({
@@ -2366,6 +2475,7 @@ function showToast(feedback) {
         setTimeout(() => toast.remove(), 320);
     }, 3500);
 }
+
 // ── Version mismatches banner ────────────────────────────────
 
 function renderVersionMismatches(states) {
@@ -2398,14 +2508,13 @@ function displayVersionHistory(contractPath, history) {
     const body      = document.getElementById('version-panel-body');
     const titleEl   = document.getElementById('version-panel-title');
 
-    // Find contract name
     const contract  = _contracts.find(c => c.path === contractPath);
     titleEl.textContent = \`Version History — \${contract ? contract.name : contractPath}\`;
 
     if (!history.length) {
         body.innerHTML = '<div class="empty-state" style="padding:16px">No version history recorded.</div>';
     } else {
-        const entries = [...history].reverse(); // newest first
+        const entries = [...history].reverse();
         body.innerHTML = entries.map(e => \`
             <div class="version-entry\${e.isDeployed ? ' deployed' : ''}">
                 <div class="version-entry-ver">v\${esc(e.version)}\${e.isDeployed ? ' 🚀' : ''}</div>
@@ -2428,7 +2537,6 @@ function promptTagVersion(contractPath, entryId) {
     const label = prompt('Enter a label for this version (e.g. "Initial release", "Bug-fix"):');
     if (!label || !label.trim()) { return; }
     vscode.postMessage({ type: 'version:tag', contractPath, entryId, label: label.trim() });
-    // Re-fetch history to reflect tag
     setTimeout(() => vscode.postMessage({ type: 'version:getHistory', contractPath }), 300);
 }
 
@@ -2458,11 +2566,9 @@ document.getElementById('sim-history-outcome-filter').addEventListener('change',
 document.getElementById('cli-history-load-btn').addEventListener('click', () => {
     vscode.postMessage({ type: 'cliHistory:getAll' });
 });
-
 document.getElementById('cli-history-export-btn').addEventListener('click', () => {
     vscode.postMessage({ type: 'cliHistory:export' });
 });
-
 document.getElementById('cli-history-clear-btn').addEventListener('click', () => {
     vscode.postMessage({ type: 'cliHistory:clear' });
 });
@@ -2476,12 +2582,12 @@ function renderCliHistory(entries) {
 
     listEl.innerHTML = entries.map(function(e) {
         var icon = e.outcome === 'success' ? '✓' : '✕';
-        var duration = e.durationMs ? ' \u00b7 ' + e.durationMs + 'ms' : '';
+        var duration = e.durationMs ? ' · ' + e.durationMs + 'ms' : '';
         var command = e.args && e.args.length > 0 ? e.command + ' ' + e.args.join(' ') : e.command;
 
         var html = '<div class="cli-history-card ' + esc(e.outcome) + '" data-entry-id="' + esc(e.id) + '">';
         html += '<div class="cli-history-cmd">' + icon + ' ' + esc(command) + '</div>';
-        html += '<div class="cli-history-meta">' + esc(e.source || 'manual') + ' \u00b7 ' + new Date(e.timestamp).toLocaleString() + duration + '</div>';
+        html += '<div class="cli-history-meta">' + esc(e.source || 'manual') + ' · ' + new Date(e.timestamp).toLocaleString() + duration + '</div>';
 
         if (e.label) {
             html += '<div class="cli-history-label">🏷 ' + esc(e.label) + '</div>';
@@ -2550,14 +2656,14 @@ function renderSimulationHistory(entries, stats) {
     }
 
     listEl.innerHTML = entries.map(function(e) {
-        var icon     = e.outcome === 'success' ? '\u2713' : '\u2717';
-        var shortId  = e.contractId.length > 12 ? e.contractId.slice(0, 8) + '\u2026' + e.contractId.slice(-4) : e.contractId;
-        var duration = e.durationMs !== undefined ? ' \u00b7 ' + e.durationMs + 'ms' : '';
+        var icon     = e.outcome === 'success' ? '✓' : '✗';
+        var shortId  = e.contractId.length > 12 ? e.contractId.slice(0, 8) + '…' + e.contractId.slice(-4) : e.contractId;
+        var duration = e.durationMs !== undefined ? ' · ' + e.durationMs + 'ms' : '';
         var html = '<div class="sim-history-card ' + esc(e.outcome) + '" data-entry-id="' + esc(e.id) + '">';
         html += '<div class="sim-history-fn">' + icon + ' ' + esc(e.functionName) + '()</div>';
-        html += '<div class="sim-history-meta">' + esc(shortId) + ' \u00b7 ' + esc(e.network) + ' \u00b7 ' + esc(e.method) + duration + '</div>';
+        html += '<div class="sim-history-meta">' + esc(shortId) + ' · ' + esc(e.network) + ' · ' + esc(e.method) + duration + '</div>';
         html += '<div class="sim-history-meta">' + new Date(e.timestamp).toLocaleString() + '</div>';
-        if (e.label) { html += '<div class="sim-history-label">\ud83c\udff7 ' + esc(e.label) + '</div>'; }
+        if (e.label) { html += '<div class="sim-history-label">🏷 ' + esc(e.label) + '</div>'; }
         if (e.outcome === 'failure' && e.error) { html += '<div class="sim-history-error" title="' + esc(e.error) + '">' + esc(e.error) + '</div>'; }
         html += '<div class="sim-history-actions">';
         html += '<button class="action-btn secondary" style="font-size:10px;padding:2px 7px" onclick="promptLabelSimulation(\'' + esc(e.id) + '\')">Label</button>';

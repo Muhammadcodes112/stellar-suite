@@ -18,6 +18,7 @@ import { registerResourceProfilingCommands } from "./commands/resourceProfilingC
 import { registerRpcAuthCommands } from "./commands/rpcAuthCommands";
 import { registerEnvVariableCommands } from "./commands/envVariableCommands";
 import { registerRpcLoggingCommands } from "./commands/rpcLoggingCommands";
+import { registerDependencyCommands } from "./commands/dependencyCommands";
 
 // Services
 import { ContractGroupService } from "./services/contractGroupService";
@@ -38,6 +39,8 @@ import { EnvVariableService } from "./services/envVariableService";
 import { RpcFallbackService } from "./services/rpcFallbackService";
 import { RpcRetryService } from "./services/rpcRetryService";
 import { createCliConfigurationService } from "./services/cliConfigurationVscode";
+import { ContractDependencyDetectionService } from "./services/contractDependencyDetectionService";
+import { ContractDependencyWatcherService } from "./services/contractDependencyWatcherService";
 import { CliHistoryService } from "./services/cliHistoryService";
 import { CliReplayService } from "./services/cliReplayService";
 import { StateMigrationService } from "./services/stateMigrationService";
@@ -72,6 +75,9 @@ let resourceProfilingService: ResourceProfilingService | undefined;
 let rpcAuthService: RpcAuthService | undefined;
 let envVariableService: EnvVariableService | undefined;
 let fallbackService: RpcFallbackService | undefined;
+// FIX: Removed duplicate declarations of retryService and retryStatusBar
+let dependencyDetectionService: ContractDependencyDetectionService | undefined;
+let dependencyWatcherService: ContractDependencyWatcherService | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
   const outputChannel = vscode.window.createOutputChannel("Stellar Suite");
@@ -168,7 +174,7 @@ export function activate(context: vscode.ExtensionContext) {
       outputChannel.appendLine(`[Extension] Metadata scan error: ${err}`);
     });
 
-    // 4. Initialize CLI History and Replay services (Local Additions)
+    // 4. Initialize CLI History and Replay services
     cliHistoryService = new CliHistoryService(context);
     cliReplayService = new CliReplayService(cliHistoryService);
     registerCliHistoryCommands(context, cliHistoryService, cliReplayService);
@@ -177,9 +183,7 @@ export function activate(context: vscode.ExtensionContext) {
     // 5. Initialize Resource Profiling and Env Variable services
     resourceProfilingService = new ResourceProfilingService(context, outputChannel);
     registerResourceProfilingCommands(context, resourceProfilingService);
-    outputChannel.appendLine(
-      "[Extension] Resource profiling service initialized and commands registered",
-    );
+    outputChannel.appendLine("[Extension] Resource profiling service initialized and commands registered");
 
     envVariableService = createEnvVariableService(context);
     registerEnvVariableCommands(context, envVariableService);
@@ -190,15 +194,15 @@ export function activate(context: vscode.ExtensionContext) {
     });
     registerRpcLoggingCommands(context, rpcLogger);
 
-    // ── RPC Authentication ──────────────────────────────────
+    // 6. Initialize RPC Auth service
     rpcAuthService = createRpcAuthService(context);
+
     const updateRpcAuthHeaders = async () => {
       if (!rpcAuthService || !fallbackService) return;
       const headers = await rpcAuthService.getAuthHeaders();
       fallbackService.updateAuthHeaders(headers);
     };
 
-    // Initialize headers on startup
     updateRpcAuthHeaders().catch(err => {
       outputChannel.appendLine(`[Error] Failed to initialize RPC Auth: ${err}`);
     });
@@ -206,7 +210,7 @@ export function activate(context: vscode.ExtensionContext) {
     registerRpcAuthCommands(context, rpcAuthService, updateRpcAuthHeaders);
     outputChannel.appendLine("[Extension] RPC Auth service initialized and commands registered");
 
-    // 6. Initialize Compilation, Backup and Sync services
+    // 7. Initialize Compilation, Backup and Sync services
     compilationMonitor = new CompilationStatusMonitor(context);
     compilationStatusProvider = new CompilationStatusProvider(compilationMonitor);
 
@@ -217,7 +221,13 @@ export function activate(context: vscode.ExtensionContext) {
     syncStatusProvider = new SyncStatusProvider(syncService);
     registerSyncCommands(context, syncService);
 
-    // 7. Initialize UI
+    // FIX: Initialize simulationReplayService before registerReplayCommands uses it
+    simulationReplayService = new SimulationReplayService(
+      simulationHistoryService!,
+      outputChannel
+    );
+
+    // 8. Initialize UI
     sidebarProvider = new SidebarViewProvider(
       context.extensionUri,
       context,
@@ -231,13 +241,9 @@ export function activate(context: vscode.ExtensionContext) {
       )
     );
 
-    simulationReplayService = new SimulationReplayService(
-      simulationHistoryService!,
-      outputChannel
-    );
+    outputChannel.appendLine("[Extension] All services initialized");
 
-    outputChannel.appendLine("[Extension] All commands registered");
-    // 7. Register Commands
+    // 9. Register Commands
     const simulateCommand = vscode.commands.registerCommand(
       "stellarSuite.simulateTransaction",
       () => simulateTransaction(context, sidebarProvider, simulationHistoryService, cliHistoryService, fallbackService, resourceProfilingService)
@@ -297,6 +303,7 @@ export function activate(context: vscode.ExtensionContext) {
     );
 
     registerSimulationHistoryCommands(context, simulationHistoryService!);
+    // FIX: Use simulationReplayService (was incorrectly replayService in the old broken copy)
     registerReplayCommands(context, simulationHistoryService!, simulationReplayService!, sidebarProvider, fallbackService);
     registerHealthCommands(context, healthMonitor!);
 
@@ -316,14 +323,14 @@ export function activate(context: vscode.ExtensionContext) {
       (contractId: string) => simulateTransaction(context, sidebarProvider, simulationHistoryService, cliHistoryService, fallbackService, resourceProfilingService, contractId)
     );
 
-    // 8. File Watchers
+    // 10. File Watchers
     const watcher = vscode.workspace.createFileSystemWatcher("**/{Cargo.toml,*.wasm}");
     const refreshOnChange = () => sidebarProvider?.refresh();
     watcher.onDidChange(refreshOnChange);
     watcher.onDidCreate(refreshOnChange);
     watcher.onDidDelete(refreshOnChange);
 
-    // 9. Subscriptions
+    // 11. Subscriptions
     context.subscriptions.push(
       simulateCommand,
       deployCommand,
@@ -340,13 +347,13 @@ export function activate(context: vscode.ExtensionContext) {
       outputChannel,
       healthMonitor!,
       healthStatusBar!,
-      retryStatusBar || { dispose: () => { } },
+      retryStatusBar || { dispose: () => {} },
       retryService!,
       fallbackService!,
       { dispose: () => metadataService?.dispose() },
-      compilationMonitor || { dispose: () => { } },
-      compilationStatusProvider || { dispose: () => { } },
-      syncStatusProvider || { dispose: () => { } }
+      compilationMonitor || { dispose: () => {} },
+      compilationStatusProvider || { dispose: () => {} },
+      syncStatusProvider || { dispose: () => {} }
     );
 
     outputChannel.appendLine("[Extension] Extension activation complete");
@@ -362,6 +369,7 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
+  dependencyWatcherService?.dispose();
   healthMonitor?.dispose();
   healthStatusBar?.dispose();
   syncStatusProvider?.dispose();
