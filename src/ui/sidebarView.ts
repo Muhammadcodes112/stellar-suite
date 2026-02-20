@@ -33,6 +33,8 @@ import {
     ExistingContract,
 } from '../services/sidebarImportService';
 import { ImportSelection, ImportPreview } from '../types/sidebarExport';
+import { ContractDependencyDetectionService, DependencyGraph } from '../services/contractDependencyDetectionService';
+import { ContractMetadataService } from '../services/contractMetadataService';
 
 export interface ContractInfo {
     name: string;
@@ -69,6 +71,18 @@ export interface ContractInfo {
     templateConfidence?: number;
     /** Pattern evidence used for this classification. */
     templateMatchedPatterns?: string[];
+    /** Direct dependencies (contracts this one depends on). */
+    dependencies?: string[];
+    /** Dependents (contracts that depend on this one). */
+    dependents?: string[];
+    /** Number of direct dependencies. */
+    dependencyCount?: number;
+    /** Number of dependents. */
+    dependentCount?: number;
+    /** Dependency depth in the graph. */
+    dependencyDepth?: number;
+    /** Whether this contract is part of a circular dependency. */
+    hasCircularDependency?: boolean;
 }
 
 export interface DeploymentRecord {
@@ -94,6 +108,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
     private readonly versionTracker: ContractVersionTracker;
     private readonly templateService: ContractTemplateService;
     private _simulationHistoryService?: SimulationHistoryService;
+    private readonly dependencyService: ContractDependencyDetectionService;
+    private dependencyGraph: DependencyGraph | null = null;
 
     // Cache the last-discovered list so drag messages can reference it
     private _lastContracts: ContractInfo[] = [];
@@ -115,6 +131,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             this._context,
             this.outputChannel
         );
+        this.dependencyService = new ContractDependencyDetectionService(this.outputChannel);
         this.templateService = new ContractTemplateService(this.outputChannel);
     }
 
@@ -527,17 +544,27 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         this.refresh();
     }
 
-    public refresh() {
+    public async refresh() {
         if (!this._view) { return; }
         this.outputChannel.appendLine('[Sidebar] Refreshing contract data…');
 
         const discovered = this._discoverContracts();
         const ordered = this.reorderingService.applyOrder(discovered);
+        
+        // Build dependency graph
+        await this._enrichWithDependencyInfo(ordered);
+        
         this._lastContracts = ordered;
 
         const deployments = this._getDeploymentHistory();
         const versionStates = this._getVersionStates(ordered);
-        this._view.webview.postMessage({ type: 'update', contracts: ordered, deployments, versionStates });
+        this._view.webview.postMessage({ 
+            type: 'update', 
+            contracts: ordered, 
+            deployments, 
+            versionStates,
+            dependencyGraph: this.dependencyGraph ? this._serializeDependencyGraph() : null
+        });
     }
 
     /** Expose versionTracker for use by commands (e.g. deployContract). */
@@ -630,8 +657,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     cargoTomlPath: cargoPath,
                     contractDir: rootPath,
                     contractName,
-                    manualTemplateId: options?.manualTemplateAssignments?.[cargoPath],
-                    customTemplates: options?.customTemplates || [],
+                    manualTemplateId: undefined,
+                    customTemplates: [],
                 });
 
                 results.push({
@@ -687,6 +714,91 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             );
         }
         return this._simulationHistoryService;
+    }
+
+    /**
+     * Enrich contract info with dependency data
+     */
+    private async _enrichWithDependencyInfo(contracts: ContractInfo[]): Promise<void> {
+        try {
+            // Build metadata for contracts
+            const metadataService = new ContractMetadataService(
+                vscode.workspace as any,
+                this.outputChannel
+            );
+            const scan = await metadataService.scanWorkspace();
+            
+            if (scan.contracts.length === 0) {
+                return;
+            }
+
+            // Build dependency graph
+            this.dependencyGraph = await this.dependencyService.buildDependencyGraph(scan.contracts, {
+                detectImports: true,
+                includeDevDependencies: false,
+                includeBuildDependencies: true,
+            });
+
+            // Enrich contract info with dependency data
+            for (const contract of contracts) {
+                const contractMeta = scan.contracts.find(c => c.cargoTomlPath === contract.path);
+                if (!contractMeta) {
+                    continue;
+                }
+
+                const node = Array.from(this.dependencyGraph.nodes.values()).find(
+                    n => n.name === contractMeta.contractName
+                );
+
+                if (node) {
+                    contract.dependencies = node.dependencies;
+                    contract.dependents = node.dependents;
+                    contract.dependencyCount = node.dependencyCount;
+                    contract.dependentCount = node.dependentCount;
+                    contract.dependencyDepth = node.depth;
+                    
+                    // Check if part of circular dependency
+                    contract.hasCircularDependency = this.dependencyGraph.cycles.some(cycle =>
+                        cycle.some(path => path.includes(contractMeta.contractName))
+                    );
+                }
+            }
+        } catch (error) {
+            this.outputChannel.appendLine(`[Sidebar] Failed to build dependency graph: ${error}`);
+        }
+    }
+
+    /**
+     * Serialize dependency graph for webview
+     */
+    private _serializeDependencyGraph(): any {
+        if (!this.dependencyGraph) {
+            return null;
+        }
+
+        return {
+            nodes: Array.from(this.dependencyGraph.nodes.values()).map(node => ({
+                name: node.name,
+                dependencies: node.dependencies,
+                dependents: node.dependents,
+                dependencyCount: node.dependencyCount,
+                dependentCount: node.dependentCount,
+                depth: node.depth,
+                isExternal: node.isExternal,
+            })),
+            edges: this.dependencyGraph.edges.map(edge => ({
+                from: edge.from,
+                to: edge.to,
+                reason: edge.reason,
+                dependencyName: edge.dependencyName,
+                source: edge.source,
+                isExternal: edge.isExternal,
+            })),
+            cycles: this.dependencyGraph.cycles,
+            deploymentOrder: this.dependencyGraph.deploymentOrder,
+            deploymentLevels: this.dependencyGraph.deploymentLevels,
+            statistics: this.dependencyGraph.statistics,
+        };
     }
 
     // ── HTML ──────────────────────────────────────────────────
@@ -870,6 +982,31 @@ body {
 .badge-template-voting  { background: rgba(100, 195, 110, .15); color: #72d67d; border: 1px solid rgba(100, 195, 110, .34); }
 .badge-template-custom  { background: rgba(187, 134, 252, .14); color: #c59bff; border: 1px solid rgba(187, 134, 252, .36); }
 .badge-template-unknown { background: rgba(255,255,255,.05); color: var(--color-muted); border: 1px solid var(--color-border); }
+
+/* ── Dependency info ─────────────────────────────────────── */
+.dependency-info {
+    display:      flex;
+    flex-wrap:    wrap;
+    gap:          4px;
+    margin-top:   6px;
+    margin-bottom: 8px;
+}
+.dep-badge {
+    background:   rgba(100, 150, 255, .12);
+    color:        #88b4ff;
+    border:       1px solid rgba(100, 150, 255, .3);
+    padding:      2px 6px;
+    border-radius: 8px;
+    white-space:  nowrap;
+    font-size:    9px;
+    font-weight:  500;
+}
+.dep-circular {
+    background:   rgba(241, 76, 76, .15);
+    color:        var(--color-danger);
+    border:       1px solid rgba(241, 76, 76, .4);
+    font-weight:  600;
+}
 
 .contract-meta {
     font-size:     11px;
@@ -1527,6 +1664,15 @@ function renderContracts(contracts) {
             <div class="contract-meta">Template: <strong>\${esc(c.templateDisplayName || 'Unknown')}</strong> · \${esc(c.templateSource || 'unknown')}</div>
             \${c.deployedVersion ? \`<div class="contract-meta" style="font-size:10px">Deployed version: <strong>v\${esc(c.deployedVersion)}</strong></div>\` : ''}
             \${c.hasVersionMismatch ? \`<div class="contract-meta" style="color:var(--color-danger);font-size:10px">⚠ \${esc(c.versionMismatchMessage || 'Version mismatch')}</div>\` : ''}
+            
+            \${c.dependencyCount !== undefined || c.dependentCount !== undefined ? \`
+                <div class="dependency-info">
+                    \${c.dependencyCount > 0 ? \`<span class="dep-badge" title="Dependencies">📦 \${c.dependencyCount} dep\${c.dependencyCount !== 1 ? 's' : ''}</span>\` : ''}
+                    \${c.dependentCount > 0 ? \`<span class="dep-badge" title="Dependents">⬆️ \${c.dependentCount} used by</span>\` : ''}
+                    \${c.dependencyDepth !== undefined ? \`<span class="dep-badge" title="Dependency depth">🔗 depth \${c.dependencyDepth}</span>\` : ''}
+                    \${c.hasCircularDependency ? \`<span class="dep-badge dep-circular" title="Circular dependency detected">⚠️ circular</span>\` : ''}
+                </div>
+            \` : ''}
 
             <div class="card-actions">
                 <button class="action-btn"

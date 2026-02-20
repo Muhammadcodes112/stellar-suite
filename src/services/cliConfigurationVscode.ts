@@ -26,6 +26,8 @@ export function readWorkspaceCliConfiguration(): CliConfiguration {
         source: config.get<string>('source', DEFAULT_CLI_CONFIGURATION.source),
         network: config.get<string>('network', DEFAULT_CLI_CONFIGURATION.network) || DEFAULT_CLI_CONFIGURATION.network,
         rpcUrl: config.get<string>('rpcUrl', DEFAULT_CLI_CONFIGURATION.rpcUrl),
+        rpcEndpoints: config.get<any[]>('rpcEndpoints', DEFAULT_CLI_CONFIGURATION.rpcEndpoints),
+        automaticFailover: config.get<boolean>('automaticFailover', DEFAULT_CLI_CONFIGURATION.automaticFailover),
         useLocalCli: config.get<boolean>('useLocalCli', DEFAULT_CLI_CONFIGURATION.useLocalCli),
     };
 }

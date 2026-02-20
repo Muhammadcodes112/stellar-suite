@@ -17,6 +17,7 @@ import { registerRpcAuthCommands } from "./commands/rpcAuthCommands";
 import { registerEnvVariableCommands } from "./commands/envVariableCommands";
 import { registerRetryCommands } from "./commands/retryCommands";
 import { registerRpcLoggingCommands } from "./commands/rpcLoggingCommands";
+import { registerDependencyCommands } from "./commands/dependencyCommands";
 
 // Services
 import { ContractGroupService } from "./services/contractGroupService";
@@ -38,6 +39,8 @@ import { RpcFallbackService } from "./services/rpcFallbackService";
 import { RpcRetryService } from "./services/rpcRetryService";
 import { RpcLogger } from "./services/rpcLogger";
 import { createCliConfigurationService } from "./services/cliConfigurationVscode";
+import { ContractDependencyDetectionService } from "./services/contractDependencyDetectionService";
+import { ContractDependencyWatcherService } from "./services/contractDependencyWatcherService";
 
 // UI
 import { SidebarViewProvider } from "./ui/sidebarView";
@@ -67,6 +70,8 @@ let envVariableService: EnvVariableService | undefined;
 let fallbackService: RpcFallbackService | undefined;
 let retryService: RpcRetryService | undefined;
 let retryStatusBar: RetryStatusBarItem | undefined;
+let dependencyDetectionService: ContractDependencyDetectionService | undefined;
+let dependencyWatcherService: ContractDependencyWatcherService | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
     const outputChannel = vscode.window.createOutputChannel("Stellar Suite");
@@ -145,6 +150,38 @@ export function activate(context: vscode.ExtensionContext) {
             outputChannel
         );
         metadataService.startWatching();
+        
+        // Initialize dependency detection services
+        dependencyDetectionService = new ContractDependencyDetectionService(outputChannel);
+        outputChannel.appendLine('[Extension] Dependency detection service initialized');
+
+        dependencyWatcherService = new ContractDependencyWatcherService(
+            context,
+            metadataService,
+            dependencyDetectionService,
+            outputChannel,
+            {
+                debounceMs: 1000,
+                watchSourceFiles: true,
+                autoRefresh: true,
+            }
+        );
+        
+        // Start dependency watcher
+        dependencyWatcherService.start().then(() => {
+            outputChannel.appendLine('[Extension] Dependency watcher started');
+        }).catch((error) => {
+            outputChannel.appendLine(`[Extension] Failed to start dependency watcher: ${error}`);
+        });
+
+        // Listen to dependency changes and refresh sidebar
+        dependencyWatcherService.onDependencyChange((event) => {
+            outputChannel.appendLine(`[Extension] Dependencies changed: ${event.type}`);
+            if (sidebarProvider) {
+                sidebarProvider.refresh();
+            }
+        });
+        
         metadataService.scanWorkspace().then(result => {
             outputChannel.appendLine(
                 `[Extension] Metadata scan: ${result.contracts.length} Cargo.toml(s)` +
@@ -166,6 +203,12 @@ export function activate(context: vscode.ExtensionContext) {
             outputChannel.appendLine('[Extension] WARNING: could not load RPC logs');
         });
         registerRpcLoggingCommands(context, rpcLogger);
+        
+        // Register dependency commands
+        if (metadataService && dependencyDetectionService) {
+            registerDependencyCommands(context, metadataService, dependencyDetectionService);
+            outputChannel.appendLine('[Extension] Dependency commands registered');
+        }
 
         // 5. Initialize Compilation, Backup and Sync services
         compilationMonitor = new CompilationStatusMonitor(context);
@@ -200,53 +243,9 @@ export function activate(context: vscode.ExtensionContext) {
 
     // ── RPC Authentication ──────────────────────────────────
     rpcAuthService = createRpcAuthService(context);
-    const updateRpcAuthHeaders = async () => {
-      if (!rpcAuthService || !rpcService) return;
-      const headers = await rpcAuthService.getAuthHeaders();
-      rpcService.setAuthHeaders(headers);
-    };
-    // Initialize headers on startup
-    updateRpcAuthHeaders().catch(err => {
-      outputChannel.appendLine(`[Error] Failed to initialize RPC Auth: ${err}`);
-    });
-    registerRpcAuthCommands(context, rpcAuthService, updateRpcAuthHeaders);
+    registerRpcAuthCommands(context, rpcAuthService, async () => {});
     outputChannel.appendLine("[Extension] RPC Auth service initialized and commands registered");
 
-    outputChannel.appendLine("[Extension] All commands registered");
-
-
-    // ── Watchers ─────────────────────────────────────────────
-    const watcher = vscode.workspace.createFileSystemWatcher('**/{Cargo.toml,*.wasm}');
-    const refreshOnChange = () => sidebarProvider?.refresh();
-    watcher.onDidChange(refreshOnChange);
-    watcher.onDidCreate(refreshOnChange);
-    watcher.onDidDelete(refreshOnChange);
-
-    context.subscriptions.push(
-      simulateCommand,
-      deployCommand,
-      buildCommand,
-      configureCliCommand,
-      refreshCommand,
-      deployFromSidebarCommand,
-      simulateFromSidebarCommand,
-      copyContractIdCommand,
-      showVersionMismatchesCommand,
-      showCompilationStatusCommand,
-      watcher,
-      { dispose: () => metadataService?.dispose() },
-      syncStatusProvider,
-      healthStatusBar ?? new vscode.Disposable(() => { }),
-      healthMonitor ?? new vscode.Disposable(() => { }),
-    );
-
-    outputChannel.appendLine('[Extension] Extension activation complete');
-  } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    outputChannel.appendLine(`[Extension] ERROR during activation: ${errorMsg}`);
-    if (error instanceof Error && error.stack) {
-      outputChannel.appendLine(`[Extension] Stack: ${error.stack}`);
-    }
         // 7. Register Commands
         const simulateCommand = vscode.commands.registerCommand(
             "stellarSuite.simulateTransaction",
@@ -372,6 +371,7 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
+    dependencyWatcherService?.dispose();
     healthMonitor?.dispose();
     healthStatusBar?.dispose();
     syncStatusProvider?.dispose();
