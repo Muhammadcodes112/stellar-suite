@@ -1388,27 +1388,94 @@ body {
     white-space: pre-wrap;
     border: 1px solid var(--color-border);
 }
+
+
+
+/* ── Filter Bar (Shared) ────────────────────────────────── */
+.filter-bar {
+    padding:       4px 8px 8px 8px;
+    display:       flex;
+    gap:           4px;
+    align-items:   center;
+    flex-wrap:     wrap;
+}
+.filter-bar input.filter-search {
+    background:    var(--color-card);
+    border:        1px solid var(--color-border);
+    border-radius: 3px;
+    color:         var(--color-fg);
+    font-size:     11px;
+    padding:       4px 6px;
+    flex:          1;
+    min-width:     120px;
+    outline:       none;
+    font-family:   inherit;
+}
+.filter-bar input.filter-search:focus { border-color: var(--color-accent); }
+.filter-bar select.filter-select {
+    background:    var(--color-card);
+    border:        1px solid var(--color-border);
+    border-radius: 3px;
+    color:         var(--color-fg);
+    font-size:     11px;
+    padding:       3px 4px;
+    outline:       none;
+    font-family:   inherit;
+}
+.contract-name mark {
+    background-color: var(--color-accent-dim);
+    color: var(--color-accent);
+    border-radius: 2px;
+}
 .cli-history-actions { display: flex; gap: 4px; margin-top: 6px; }
 </style>
     </head>
     < body >
-
-                                    < !-- ── Header ─────────────────────────────────────────────── -->
-                                        <div class="header" >
-                                            <h1>Stellar Suite </h1>
-                                                < div class="header-actions" >
-                                                    <button class="icon-btn" id = "export-btn"      title = "Export contracts" >📤 Export </button>
-                                                        < button class="icon-btn" id = "import-btn"      title = "Import contracts" >📥 Import </button>
-                                                            < button class="icon-btn" id = "reset-order-btn" title = "Reset contract order to default" >↺ Reset order </button>
-                                                                < button class="icon-btn" id = "refresh-btn"     title = "Refresh contracts" >↻ Refresh </button>
-                                                                    </div>
-                                                                    </div>
+    
+    
+<<!-- ── Header ─────────────────────────────────────────────── -->
+<div class="header">
+    <h1>Stellar Suite</h1>
+    <div class="header-actions">
+        <button class="icon-btn" id="export-btn" title="Export contracts">📤 Export</button>
+        <button class="icon-btn" id="import-btn" title="Import contracts">📥 Import</button>
+        <button class="icon-btn" id="reset-order-btn" title="Reset contract order to default">↺ Reset order</button>
+        <button class="icon-btn" id="refresh-btn" title="Refresh contracts">↻ Refresh</button>
+    </div>
+</div>
 
 <!-- ── Contracts section ─────────────────────────────────── -->
-<div class="section-label">Contracts</div>
-<div id="contracts-list" role="listbox" aria-label="Contract list">
-    <div class="empty-state"><div class="emoji">🔍</div>Scanning for contracts…</div>
+<div class="section-label" style="display:flex;align-items:center;justify-content:space-between;padding-right:14px">
+    Contracts
+    <span style="display:flex;gap:4px">
+        <button class="icon-btn" id="contract-filter-reset-btn" title="Reset all filters" style="font-size:11px;padding:2px 5px;display:none;">✕ Reset</button>
+    </span>
 </div>
+
+<div class="filter-bar" id="contract-filter-bar">
+    <input type="text" id="contract-search" class="filter-search" placeholder="Search contracts…" />
+    <select id="contract-build-filter" class="filter-select" title="Build Status">
+        <option value="">Any Build</option>
+        <option value="built">Built</option>
+        <option value="not-built">Not Built</option>
+    </select>
+    <select id="contract-deploy-filter" class="filter-select" title="Deploy Status">
+        <option value="">Any Status</option>
+        <option value="deployed">Deployed</option>
+        <option value="not-deployed">Not Deployed</option>
+    </select>
+    <select id="contract-template-filter" class="filter-select" title="Template Type">
+        <option value="">Any Template</option>
+    </select>
+</div>
+
+<div id="contracts-list" role="listbox" aria-label="Contract list">
+    <div class="empty-state">
+        <div class="emoji">🔍</div>
+        Scanning for contracts…
+    </div>
+</div>
+
 
                                                                                     < !-- ── Deployments section ───────────────────────────────── -->
                                                                                         <div class="section-label" > Deployments </div>
@@ -1497,6 +1564,14 @@ let _dropTargetEl = null;
 // ── Keyboard navigation state ─────────────────────────────────
 let _focusedContractIndex = -1;
 let _showShortcutHints    = true;
+// Filter preferences
+const _savedState = vscode.getState() || {};
+let _filters = _savedState.filters || {
+    search: '',
+    build: '',
+    deploy: '',
+    template: ''
+};
 
 // ── Import state ──────────────────────────────────────────────
 let _importPreview = null;
@@ -1507,9 +1582,10 @@ window.addEventListener('message', (event) => {
     const msg = event.data;
     switch (msg.type) {
         case 'update':
-            _contracts = msg.contracts || [];
-            _versionStates = msg.versionStates || [];
-            renderContracts(_contracts);
+            _contracts     = msg.contracts     || [];
+            _versionStates = msg.versionStates  || [];
+            updateTemplateDropdown();
+            renderFilteredContracts();
             renderDeployments(msg.deployments || []);
             renderVersionMismatches(_versionStates);
             break;
@@ -1851,6 +1927,7 @@ document.addEventListener('click', (e) => {
 });
 
 // ── Render contracts ──────────────────────────────────────────
+// ── Render contracts ──────────────────────────────────────────
 function templateBadgeClass(contract) {
     if (!contract || !contract.templateCategory) { return 'badge badge-template-unknown'; }
     const category = String(contract.templateCategory).toLowerCase();
@@ -1868,13 +1945,151 @@ function templateActionTitle(contract) {
     return 'Open template-specific actions';
 }
 
-function renderContracts(contracts) {
+// Ensure highlighting doesn't break HTML parsing
+function highlightMatch(text, query) {
+    if (!query) return esc(text);
+    const textLower = text.toLowerCase();
+    const queryLower = query.toLowerCase();
+    const idx = textLower.indexOf(queryLower);
+    if (idx === -1) return esc(text);
+    
+    const before = text.substring(0, idx);
+    const match = text.substring(idx, idx + query.length);
+    const after = text.substring(idx + query.length);
+    
+    return \`\${esc(before)}<mark>\${esc(match)}</mark>\${esc(after)}\`;
+}
+
+function updateTemplateDropdown() {
+    const filterEl = document.getElementById('contract-template-filter');
+    const prevValue = filterEl.value;
+    
+    const categories = new Set(_contracts.map(c => c.templateCategory || 'unknown'));
+    const sorted = Array.from(categories).sort();
+    
+    let html = '<option value="">Any Template</option>';
+    for (const cat of sorted) {
+        const catStr = String(cat);
+        const name = catStr.charAt(0).toUpperCase() + catStr.slice(1);
+        html += \`<option value="\${esc(catStr)}">\${esc(name)}</option>\`;
+    }
+    
+    filterEl.innerHTML = html;
+    if (categories.has(prevValue)) {
+        filterEl.value = prevValue;
+    } else {
+        filterEl.value = '';
+        _filters.template = '';
+        saveFilters();
+    }
+}
+
+function saveFilters() {
+    vscode.setState({ ...vscode.getState(), filters: _filters });
+}
+
+function applyContractFiltersAndSearch() {
+    let result = _contracts.filter(c => {
+        // Build filter
+        if (_filters.build === 'built' && !c.isBuilt) return false;
+        if (_filters.build === 'not-built' && c.isBuilt) return false;
+        
+        // Deploy filter
+        if (_filters.deploy === 'deployed' && !c.contractId) return false;
+        if (_filters.deploy === 'not-deployed' && c.contractId) return false;
+        
+        // Template filter
+        if (_filters.template && (c.templateCategory || 'unknown') !== _filters.template) return false;
+        
+        // Search filter
+        if (_filters.search) {
+            const query = _filters.search.toLowerCase();
+            if (!c.name.toLowerCase().includes(query)) return false;
+        }
+        
+        return true;
+    });
+    
+    return result;
+}
+
+function initFilters() {
+    const searchInp = document.getElementById('contract-search');
+    const buildSel = document.getElementById('contract-build-filter');
+    const deploySel = document.getElementById('contract-deploy-filter');
+    const templateSel = document.getElementById('contract-template-filter');
+    const resetBtn = document.getElementById('contract-filter-reset-btn');
+
+    // Restore from state
+    if (searchInp) searchInp.value = _filters.search || '';
+    if (buildSel) buildSel.value = _filters.build || '';
+    if (deploySel) deploySel.value = _filters.deploy || '';
+    if (templateSel) templateSel.value = _filters.template || '';
+
+    const updateResetBtn = () => {
+        const active = _filters.search || _filters.build || _filters.deploy || _filters.template;
+        if (resetBtn) resetBtn.style.display = active ? 'block' : 'none';
+        saveFilters();
+        renderFilteredContracts();
+    };
+
+    let debounceTimer;
+    searchInp?.addEventListener('input', (e) => {
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+            _filters.search = e.target.value.trim();
+            updateResetBtn();
+        }, 200);
+    });
+
+    buildSel?.addEventListener('change', (e) => {
+        _filters.build = e.target.value;
+        updateResetBtn();
+    });
+
+    deploySel?.addEventListener('change', (e) => {
+        _filters.deploy = e.target.value;
+        updateResetBtn();
+    });
+
+    templateSel?.addEventListener('change', (e) => {
+        _filters.template = e.target.value;
+        updateResetBtn();
+    });
+
+    resetBtn?.addEventListener('click', () => {
+        _filters = { search: '', build: '', deploy: '', template: '' };
+        searchInp.value = '';
+        buildSel.value = '';
+        deploySel.value = '';
+        templateSel.value = '';
+        updateResetBtn();
+    });
+
+    // In case there were saved active filters on load, set up UI
+    updateResetBtn();
+}
+
+function renderFilteredContracts() {
+    const filtered = applyContractFiltersAndSearch();
+    renderContracts(filtered, _contracts.length);
+}
+
+function renderContracts(contracts, totalCount = contracts.length) {
     const el = document.getElementById('contracts-list');
-    if (!contracts.length) {
+    if (!totalCount) {
         el.innerHTML = \`<div class="empty-state">
             <div class="emoji">📂</div>
             No Soroban contracts detected.<br>
             Open a workspace containing a <code>Cargo.toml</code> with <code>soroban-sdk</code>.
+        </div>\`;
+        return;
+    }
+    
+    if (totalCount > 0 && contracts.length === 0) {
+        el.innerHTML = \`<div class="empty-state">
+            <div class="emoji">🔍</div>
+            No contracts match active filters.
         </div>\`;
         return;
     }
@@ -1907,7 +2122,7 @@ function renderContracts(contracts) {
 
             <div class="card-header">
                 <span class="drag-handle" aria-hidden="true">\${c.isPinned ? '📌' : '⠿'}</span>
-                <span class="contract-name">\${esc(c.name)}</span>
+                <span class="contract-name">\${highlightMatch(c.name, _filters.search)}</span>
                 \${c.contractId ? '<span class="badge badge-deployed">Deployed</span>' : ''}
                 \${c.isBuilt
                     ? '<span class="badge badge-built">Built</span>'
@@ -1967,6 +2182,10 @@ function renderContracts(contracts) {
         }
     }
 }
+
+// Initialize filters immediately
+setTimeout(initFilters, 0);
+
 
 function sendAction(actionId, card) {
     vscode.postMessage({
@@ -2064,7 +2283,7 @@ function reorderLocally(fromPath, toPath) {
     const [moved] = updated.splice(fromIdx, 1);
     updated.splice(toIdx, 0, moved);
     _contracts = updated;
-    renderContracts(_contracts);
+    renderFilteredContracts();
 }
 
 // ── Context menu ──────────────────────────────────────────────
