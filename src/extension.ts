@@ -16,6 +16,8 @@ import { manageCliConfiguration } from "./commands/manageCliConfiguration";
 import { registerSyncCommands } from "./commands/syncCommands";
 import { WorkspaceStateSyncService } from "./services/workspaceStateSyncService";
 import { SyncStatusProvider } from "./ui/syncStatusProvider";
+import { CompilationStatusMonitor } from "./services/compilationStatusMonitor";
+import { CompilationStatusProvider } from "./ui/compilationStatusProvider";
 
 let sidebarProvider: SidebarViewProvider | undefined;
 let groupService: ContractGroupService | undefined;
@@ -23,7 +25,8 @@ let versionTracker: ContractVersionTracker | undefined;
 let metadataService: ContractMetadataService | undefined;
 let syncService: WorkspaceStateSyncService | undefined;
 let syncStatusProvider: SyncStatusProvider | undefined;
-let encryptionService: WorkspaceStateEncryptionService | undefined;
+let compilationMonitor: CompilationStatusMonitor | undefined;
+let compilationStatusProvider: CompilationStatusProvider | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
   const outputChannel = vscode.window.createOutputChannel("Stellar Suite");
@@ -53,6 +56,13 @@ export function activate(context: vscode.ExtensionContext) {
     syncStatusProvider = new SyncStatusProvider(syncService);
     outputChannel.appendLine(
       "[Extension] Workspace state sync service initialized",
+    );
+
+    // Initialize compilation status monitor
+    compilationMonitor = new CompilationStatusMonitor(context);
+    compilationStatusProvider = new CompilationStatusProvider(compilationMonitor);
+    outputChannel.appendLine(
+      "[Extension] Compilation status monitor initialized",
     );
 
     // Initialize contract metadata service
@@ -103,7 +113,7 @@ export function activate(context: vscode.ExtensionContext) {
 
     const buildCommand = vscode.commands.registerCommand(
       "stellarSuite.buildContract",
-      () => buildContract(context, sidebarProvider),
+      () => buildContract(context, sidebarProvider, compilationMonitor),
     );
 
     const configureCliCommand = vscode.commands.registerCommand(
@@ -243,6 +253,20 @@ export function activate(context: vscode.ExtensionContext) {
         await versionTracker.notifyMismatches();
       },
     );
+
+    // ── Compilation status commands ─────────────────────────
+    const showCompilationStatusCommand = vscode.commands.registerCommand(
+      "stellarSuite.showCompilationStatus",
+      async () => {
+        if (!compilationStatusProvider) {
+          vscode.window.showInformationMessage(
+            "Stellar Suite: Compilation status monitor not initialized.",
+          );
+          return;
+        }
+        await compilationStatusProvider.showCompilationStatus();
+      },
+    );
     // Register sync commands
     if (syncService) {
       registerSyncCommands(context, syncService);
@@ -272,9 +296,12 @@ export function activate(context: vscode.ExtensionContext) {
       simulateFromSidebarCommand,
       copyContractIdCommand,
       showVersionMismatchesCommand,
+      showCompilationStatusCommand,
       watcher,
       { dispose: () => metadataService?.dispose() },
       syncStatusProvider || { dispose: () => {} },
+      compilationStatusProvider || { dispose: () => {} },
+      { dispose: () => compilationMonitor?.dispose() },
     );
 
     outputChannel.appendLine("[Extension] Extension activation complete");
@@ -295,8 +322,7 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
-    healthMonitor?.dispose();
-    healthStatusBar?.dispose();
-    syncStatusProvider?.dispose();
   syncStatusProvider?.dispose();
+  compilationStatusProvider?.dispose();
+  compilationMonitor?.dispose();
 }
