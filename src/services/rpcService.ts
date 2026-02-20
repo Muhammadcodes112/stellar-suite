@@ -30,6 +30,7 @@ export interface SimulationResult {
 export class RpcService {
     private rpcUrl: string;
     private logger?: any;
+    private authHeaders: Record<string, string> = {};
 
     constructor(rpcUrl: string, logger?: any) {
         // Ensure URL ends with / for proper path joining
@@ -85,7 +86,8 @@ export class RpcService {
             const response = await fetch(url, {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json'
+                    'Content-Type': 'application/json',
+                    ...this.authHeaders
                 },
                 body: JSON.stringify(requestBody),
                 signal: AbortSignal.timeout(30000) // 30 second timeout
@@ -117,7 +119,7 @@ export class RpcService {
 
             // Extract result from RPC response
             const result = data.result || data;
-            
+
             return {
                 success: true,
                 result: result.returnValue || result.result || result,
@@ -167,6 +169,7 @@ export class RpcService {
         try {
             const response = await fetch(`${this.rpcUrl}/health`, {
                 method: 'GET',
+                headers: { ...this.authHeaders },
                 signal: AbortSignal.timeout(5000)
             });
 
@@ -177,7 +180,7 @@ export class RpcService {
             try {
                 const response = await fetch(`${this.rpcUrl}/rpc`, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: { 'Content-Type': 'application/json', ...this.authHeaders },
                     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getHealth' }),
                     signal: AbortSignal.timeout(5000)
                 });
@@ -196,6 +199,13 @@ export class RpcService {
      */
     public setLogger(logger: any): void {
         this.logger = logger;
+    }
+
+    /**
+     * Set authentication headers for all RPC requests.
+     */
+    public setAuthHeaders(headers: Record<string, string>): void {
+        this.authHeaders = { ...headers };
     }
 
     /**
