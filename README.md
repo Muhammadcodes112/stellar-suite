@@ -27,6 +27,15 @@ Stellar Suite is designed to streamline this process by providing an interactive
 
 The first release focuses on simplifying contract deployment, transaction simulation and invocation.
 
+### Enhanced CLI Error Guidance
+
+Stellar Suite parses Stellar CLI errors into structured, readable feedback:
+
+- Detects error type (network, validation, execution)
+- Extracts error codes and useful context
+- Formats detailed error output for panels/output logs
+- Provides actionable suggestions for faster recovery
+
 ### One-Click Contract Build & Deployment
 
 Stellar Suite allows developers to build and deploy contracts using the official Stellar CLI without leaving VS Code.
@@ -138,6 +147,17 @@ The extension will compile your contract and display build results.
 3. Enter contract ID, function name, and arguments
 
 Results are displayed in a formatted panel with return values and resource usage.
+
+### CLI Configuration Management
+
+Use **Stellar Suite: Configure CLI** to manage CLI settings with profiles.
+
+You can:
+
+- Create and switch configuration profiles
+- Validate CLI/network/source/RPC settings
+- Apply active profile settings to workspace configuration
+- Export and import profiles as JSON
 
 ### Using the Sidebar
 
