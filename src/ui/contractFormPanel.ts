@@ -62,17 +62,29 @@ export class ContractFormPanel {
   private readonly _panel: vscode.WebviewPanel;
   private _disposables: vscode.Disposable[] = [];
   private _resolveSubmit?: (args: Record<string, string> | null) => void;
+  private readonly _form: GeneratedForm;
+
   private readonly _onDidReceiveLiveValidation = new vscode.EventEmitter<
     Record<string, string>
   >();
+  public readonly onDidReceiveLiveValidation =
+    this._onDidReceiveLiveValidation.event;
+
   private readonly _onDidReceiveSaveTemplate = new vscode.EventEmitter<
     Record<string, string>
   >();
+  public readonly onDidReceiveSaveTemplate =
+    this._onDidReceiveSaveTemplate.event;
+
   private readonly _onDidReceiveLoadTemplate =
     new vscode.EventEmitter<string>();
+  public readonly onDidReceiveLoadTemplate =
+    this._onDidReceiveLoadTemplate.event;
+
   private readonly _onDidReceiveDeleteTemplate =
     new vscode.EventEmitter<string>();
-  private readonly _form: GeneratedForm;
+  public readonly onDidReceiveDeleteTemplate =
+    this._onDidReceiveDeleteTemplate.event;
 
   private constructor(panel: vscode.WebviewPanel, form: GeneratedForm) {
     this._panel = panel;
@@ -202,27 +214,13 @@ export class ContractFormPanel {
     this._panel.webview.postMessage({ type: "loadTemplateData", data });
   }
 
-  public get onDidReceiveLiveValidation(): vscode.Event<
-    Record<string, string>
-  > {
-    return this._onDidReceiveLiveValidation.event;
-  }
-
-  public get onDidReceiveSaveTemplate(): vscode.Event<Record<string, string>> {
-    return this._onDidReceiveSaveTemplate.event;
-  }
-
-  public get onDidReceiveLoadTemplate(): vscode.Event<string> {
-    return this._onDidReceiveLoadTemplate.event;
-  }
-
-  public get onDidReceiveDeleteTemplate(): vscode.Event<string> {
-    return this._onDidReceiveDeleteTemplate.event;
-  }
-
   public dispose(): void {
     ContractFormPanel.currentPanel = undefined;
     this._panel.dispose();
+    this._onDidReceiveLiveValidation.dispose();
+    this._onDidReceiveSaveTemplate.dispose();
+    this._onDidReceiveLoadTemplate.dispose();
+    this._onDidReceiveDeleteTemplate.dispose();
     while (this._disposables.length) {
       const d = this._disposables.pop();
       if (d) {
@@ -302,13 +300,19 @@ export class ContractFormPanel {
         input.field-invalid,
         select.field-invalid,
         textarea.field-invalid {
-            border-color: var(--vscode-inputValidation-errorBorder, #f44);
+            border: 1px solid var(--vscode-inputValidation-errorBorder, #f44);
+        }
+        input.field-valid,
+        select.field-valid,
+        textarea.field-valid {
+            border: 1px solid var(--vscode-testing-iconPassed, #73c991);
         }
         input:disabled,
         select:disabled,
         textarea:disabled {
             opacity: 0.5;
             cursor: not-allowed;
+            border-color: var(--vscode-input-border, #ccc);
         }
         .field-error {
             display: block;
@@ -387,16 +391,21 @@ export class ContractFormPanel {
 
         // ── Form submission ───────────────────────────────────
         const form = document.getElementById('contract-form');
+
+        function getFormData() {
+            const raw = new FormData(form);
+            const args = {};
+            raw.forEach(function(value, key) {
+                args[key] = value;
+            });
+            return args;
+        }
+
         if (form) {
             form.addEventListener('submit', function(e) {
                 e.preventDefault();
                 clearAllErrors();
-                const raw = new FormData(e.target);
-                const args = {};
-                raw.forEach(function(value, key) {
-                    args[key] = value;
-                });
-                vscode.postMessage({ type: 'formSubmit', args: args });
+                vscode.postMessage({ type: 'formSubmit', args: getFormData() });
             });
         }
 
@@ -421,9 +430,26 @@ export class ContractFormPanel {
                         input.disabled = checkbox.checked;
                         if (checkbox.checked) {
                             input.value = '';
+                            input.classList.remove('field-invalid', 'field-valid');
+                            const errSpan = document.getElementById('err-' + paramName);
+                            if (errSpan) errSpan.textContent = '';
                         }
                     });
                 }
+                vscode.postMessage({ type: 'liveValidate', args: getFormData() });
+            });
+        });
+
+        // ── Live Validation Triggers ──────────────────────────
+        const inputsToWatch = document.querySelectorAll('#contract-form input:not([type="hidden"]):not([type="checkbox"]), #contract-form select, #contract-form textarea');
+        inputsToWatch.forEach(function(input) {
+            input.addEventListener('input', function() {
+                // Remove generic valid state upon typing immediately, wait for round-trip for red/green
+                input.classList.remove('field-valid');
+                vscode.postMessage({ type: 'liveValidate', args: getFormData() });
+            });
+            input.addEventListener('change', function() {
+                vscode.postMessage({ type: 'liveValidate', args: getFormData() });
             });
         });
 
@@ -512,14 +538,23 @@ export class ContractFormPanel {
         }
 
         function showErrors(errors) {
-            Object.keys(errors).forEach(function(paramName) {
+            const allInputs = document.querySelectorAll('#contract-form input:not([type="hidden"]):not([type="checkbox"]), #contract-form select, #contract-form textarea');
+            allInputs.forEach(function(input) {
+                if (input.disabled) return;
+                const paramName = input.name;
                 const errSpan = document.getElementById('err-' + paramName);
-                const input = document.querySelector('[name="' + paramName + '"]');
-                if (errSpan) {
-                    errSpan.textContent = errors[paramName];
-                }
-                if (input) {
+                
+                // Clear previous state
+                input.classList.remove('field-invalid', 'field-valid');
+                if (errSpan) errSpan.textContent = '';
+
+                if (errors[paramName]) {
+                    // Invalid
                     input.classList.add('field-invalid');
+                    if (errSpan) errSpan.textContent = errors[paramName];
+                } else if (input.value.trim() !== '') {
+                    // Valid (and not empty)
+                    input.classList.add('field-valid');
                 }
             });
         }
@@ -529,7 +564,8 @@ export class ContractFormPanel {
                 const wrapper = document.querySelector('[data-param="' + paramName + '"]');
                 if (wrapper) {
                     const helpSpan = wrapper.querySelector('.field-help');
-                    if (helpSpan && warnings[paramName]) {
+                    // Avoid duplicating warning text if already added
+                    if (helpSpan && warnings[paramName] && !helpSpan.textContent.includes(warnings[paramName])) {
                         helpSpan.textContent += ' (' + warnings[paramName] + ')';
                     }
                 }
@@ -540,8 +576,8 @@ export class ContractFormPanel {
             document.querySelectorAll('.field-error').forEach(function(el) {
                 el.textContent = '';
             });
-            document.querySelectorAll('.field-invalid').forEach(function(el) {
-                el.classList.remove('field-invalid');
+            document.querySelectorAll('.field-invalid, .field-valid').forEach(function(el) {
+                el.classList.remove('field-invalid', 'field-valid');
             });
         }
     </script>
