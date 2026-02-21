@@ -187,11 +187,23 @@ export async function simulateTransaction(
 
     let sanitizedArgs: Record<string, unknown> | null = null;
 
+    // Attach real-time validation listener
+    const liveValidationDisposable = formPanel.onDidReceiveLiveValidation(
+      (formData) => {
+        const vr = formValidator.validate(formData, abiParams, sanitizer);
+        formPanel.showErrors(vr.errors);
+        if (Object.keys(vr.warnings).length > 0) {
+          formPanel.showWarnings(vr.warnings);
+        }
+      },
+    );
+
     // Validation loop — panel stays open until valid data is submitted or user cancels
     while (sanitizedArgs === null) {
       const formData = await formPanel.waitForSubmit();
 
       if (formData === null) {
+        liveValidationDisposable.dispose();
         return; // User cancelled or closed the panel
       }
 
@@ -208,6 +220,8 @@ export async function simulateTransaction(
 
       sanitizedArgs = vr.sanitizedArgs;
     }
+
+    liveValidationDisposable.dispose();
 
     if (selectedFunction && selectedFunction.parameters && sanitizedArgs) {
       for (const param of selectedFunction.parameters) {
