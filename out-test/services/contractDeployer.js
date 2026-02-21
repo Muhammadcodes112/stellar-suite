@@ -34,13 +34,12 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ContractDeployer = void 0;
-const child_process_1 = require("child_process");
-const util_1 = require("util");
 const path = __importStar(require("path"));
 const fs = __importStar(require("fs"));
 const os = __importStar(require("os"));
+const cliOutputStreamingService_1 = require("./cliOutputStreamingService");
 const cliErrorParser_1 = require("../utils/cliErrorParser");
-const execFileAsync = (0, util_1.promisify)(child_process_1.execFile);
+const deploymentRetryService_1 = require("./deploymentRetryService");
 function getEnvironmentWithPath() {
     const env = { ...process.env };
     const homeDir = os.homedir();
@@ -58,21 +57,106 @@ function getEnvironmentWithPath() {
     return env;
 }
 class ContractDeployer {
-    constructor(cliPath, source = 'dev', network = 'testnet') {
+    constructor(cliPath, source = 'dev', network = 'testnet', streamingService, retryService) {
         this.cliPath = cliPath;
         this.source = source;
         this.network = network;
+        this.streamingService = streamingService || new cliOutputStreamingService_1.CliOutputStreamingService();
+        this.retryService = retryService || new deploymentRetryService_1.DeploymentRetryService();
     }
-    async buildContract(contractPath) {
+    /**
+     * Deploy a contract with automatic retry and exponential backoff.
+     *
+     * Wraps {@link deployContract} with configurable retry logic. Transient
+     * failures (network errors, timeouts, rate limits) are retried automatically;
+     * permanent failures (invalid WASM, auth errors) are surfaced immediately.
+     *
+     * @param wasmPath     Path to the compiled WASM file
+     * @param retryConfig  Optional retry policy overrides
+     * @returns            The completed retry session record
+     */
+    async deployWithRetry(wasmPath, retryConfig) {
+        const params = {
+            wasmPath,
+            network: this.network,
+            source: this.source,
+            cliPath: this.cliPath,
+            retryConfig,
+        };
+        return this.retryService.deploy(params);
+    }
+    /**
+     * Cancel an active retry-managed deployment by its session ID.
+     *
+     * @param sessionId  The session ID returned by {@link deployWithRetry}
+     * @returns          `true` if the session was found and cancelled
+     */
+    cancelRetry(sessionId) {
+        return this.retryService.cancel(sessionId);
+    }
+    /**
+     * Retrieve the retry history for deployments run through this deployer instance.
+     */
+    getRetryHistory() {
+        return this.retryService.getHistory();
+    }
+    /**
+     * Register a callback to receive live retry status events.
+     * Returns a disposer that removes the listener.
+     */
+    onRetryStatusChange(listener) {
+        return this.retryService.onStatusChange(listener);
+    }
+    async buildContract(contractPath, options = {}) {
         try {
             const env = getEnvironmentWithPath();
-            const { stdout, stderr } = await execFileAsync(this.cliPath, ['contract', 'build'], {
+            const streamResult = await this.streamingService.run({
+                command: this.cliPath,
+                args: ['contract', 'build'],
                 cwd: contractPath,
-                env: env,
-                maxBuffer: 10 * 1024 * 1024,
-                timeout: 120000
+                env,
+                timeoutMs: options.timeoutMs ?? 120000,
+                maxBufferedBytes: options.maxBufferedBytes ?? 10 * 1024 * 1024,
+                cancellationToken: options.cancellationToken,
+                onStdout: options.onStdout,
+                onStderr: options.onStderr,
             });
-            const output = stdout + stderr;
+            const output = streamResult.combinedOutput;
+            if (streamResult.cancelled) {
+                return {
+                    success: false,
+                    cancelled: true,
+                    output: output || 'Build cancelled by user.',
+                    errorSummary: 'Build cancelled by user.',
+                    errorType: 'execution',
+                    errorSuggestions: ['Re-run the build when ready.'],
+                };
+            }
+            if (streamResult.timedOut) {
+                return {
+                    success: false,
+                    output: output || (streamResult.error ?? 'Build timed out.'),
+                    errorSummary: 'Build timed out.',
+                    errorType: 'execution',
+                    errorSuggestions: ['Try again, or increase command timeout for long builds.'],
+                };
+            }
+            if (!streamResult.success) {
+                const parsedError = (0, cliErrorParser_1.parseCliErrorOutput)(output || streamResult.error || 'Build failed.', {
+                    command: 'stellar contract build',
+                    network: this.network,
+                });
+                (0, cliErrorParser_1.logCliError)(parsedError, '[Build CLI]');
+                return {
+                    success: false,
+                    output: (0, cliErrorParser_1.formatCliErrorForDisplay)(parsedError),
+                    errorSummary: (0, cliErrorParser_1.formatCliErrorForNotification)(parsedError),
+                    errorType: parsedError.type,
+                    errorCode: parsedError.code,
+                    errorSuggestions: parsedError.suggestions,
+                    rawError: parsedError.normalized,
+                };
+            }
             const wasmMatch = output.match(/target\/wasm32[^\/]*\/release\/[^\s]+\.wasm/);
             let wasmPath;
             if (wasmMatch) {
@@ -96,7 +180,9 @@ class ContractDeployer {
             }
             return {
                 success: true,
-                output,
+                output: streamResult.truncated
+                    ? `${output}\n\n[Stellar Suite] Output was truncated for display.`
+                    : output,
                 wasmPath
             };
         }
@@ -127,7 +213,7 @@ class ContractDeployer {
      * @param wasmPath - Path to the compiled WASM file
      * @returns Deployment result with contract ID and transaction hash
      */
-    async deployContract(wasmPath) {
+    async deployContract(wasmPath, options = {}) {
         try {
             // Verify WASM file exists
             if (!fs.existsSync(wasmPath)) {
@@ -141,19 +227,61 @@ class ContractDeployer {
             }
             // Get environment with proper PATH
             const env = getEnvironmentWithPath();
-            // Run stellar contract deploy
-            const { stdout, stderr } = await execFileAsync(this.cliPath, [
-                'contract',
-                'deploy',
-                '--wasm', wasmPath,
-                '--source', this.source,
-                '--network', this.network
-            ], {
-                env: env,
-                maxBuffer: 10 * 1024 * 1024,
-                timeout: 60000 // 1 minute for deployment
+            const streamResult = await this.streamingService.run({
+                command: this.cliPath,
+                args: [
+                    'contract',
+                    'deploy',
+                    '--wasm', wasmPath,
+                    '--source', this.source,
+                    '--network', this.network
+                ],
+                env,
+                timeoutMs: options.timeoutMs ?? 60000,
+                maxBufferedBytes: options.maxBufferedBytes ?? 10 * 1024 * 1024,
+                cancellationToken: options.cancellationToken,
+                onStdout: options.onStdout,
+                onStderr: options.onStderr,
             });
-            const output = stdout + stderr;
+            const output = streamResult.combinedOutput;
+            if (streamResult.cancelled) {
+                return {
+                    success: false,
+                    error: 'Deployment cancelled by user.',
+                    errorSummary: 'Deployment cancelled by user.',
+                    errorType: 'execution',
+                    errorSuggestions: ['Re-run deployment when ready.'],
+                    deployOutput: output,
+                };
+            }
+            if (streamResult.timedOut) {
+                return {
+                    success: false,
+                    error: 'Deployment timed out.',
+                    errorSummary: 'Deployment timed out.',
+                    errorType: 'execution',
+                    errorSuggestions: ['Try again, or increase command timeout for long deployments.'],
+                    deployOutput: output,
+                };
+            }
+            if (!streamResult.success) {
+                const parsedError = (0, cliErrorParser_1.parseCliErrorOutput)(output || streamResult.error || 'Deployment failed.', {
+                    command: 'stellar contract deploy',
+                    network: this.network,
+                });
+                (0, cliErrorParser_1.logCliError)(parsedError, '[Deploy CLI]');
+                return {
+                    success: false,
+                    error: (0, cliErrorParser_1.formatCliErrorForDisplay)(parsedError),
+                    errorSummary: (0, cliErrorParser_1.formatCliErrorForNotification)(parsedError),
+                    errorType: parsedError.type,
+                    errorCode: parsedError.code,
+                    errorSuggestions: parsedError.suggestions,
+                    errorContext: parsedError.context,
+                    rawError: parsedError.normalized,
+                    deployOutput: output,
+                };
+            }
             // Parse output to extract Contract ID and transaction hash
             // Typical output format:
             // "Contract ID: C..."
@@ -189,7 +317,9 @@ class ContractDeployer {
                 success: true,
                 contractId,
                 transactionHash,
-                deployOutput: output
+                deployOutput: streamResult.truncated
+                    ? `${output}\n\n[Stellar Suite] Output was truncated for display.`
+                    : output
             };
         }
         catch (error) {
@@ -227,9 +357,9 @@ class ContractDeployer {
      * @param contractPath - Path to contract directory
      * @returns Deployment result
      */
-    async buildAndDeploy(contractPath) {
+    async buildAndDeploy(contractPath, options = {}) {
         // First build
-        const buildResult = await this.buildContract(contractPath);
+        const buildResult = await this.buildContract(contractPath, options);
         if (!buildResult.success) {
             return {
                 success: false,
@@ -250,7 +380,7 @@ class ContractDeployer {
             };
         }
         // Then deploy
-        const deployResult = await this.deployContract(buildResult.wasmPath);
+        const deployResult = await this.deployContract(buildResult.wasmPath, options);
         deployResult.buildOutput = buildResult.output;
         return deployResult;
     }
@@ -260,8 +390,8 @@ class ContractDeployer {
      * @param wasmPath - Path to WASM file
      * @returns Deployment result
      */
-    async deployFromWasm(wasmPath) {
-        return this.deployContract(wasmPath);
+    async deployFromWasm(wasmPath, options = {}) {
+        return this.deployContract(wasmPath, options);
     }
     getExecErrorStream(error, stream) {
         if (typeof error !== 'object' || error === null) {

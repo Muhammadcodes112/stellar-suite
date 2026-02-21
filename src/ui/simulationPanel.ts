@@ -2,6 +2,8 @@ import * as vscode from "vscode";
 import { SimulationResult } from "../services/sorobanCliService";
 import { StateDiffService } from "../services/stateDiffService";
 import { StateDiffChange } from "../types/simulationState";
+import { SimulationChartDataService } from "../services/simulationChartDataService";
+import { SimulationChartRenderer } from "../services/simulationChartRenderer";
 
 /**
  * Manages the WebView panel that displays simulation results.
@@ -241,6 +243,95 @@ export class SimulationPanel {
     </div>
 </body>
 </html>`;
+  }
+
+  private _getChartsHtml(result: SimulationResult): string {
+    const sections: string[] = [];
+
+    // Resource usage bar chart
+    const resourceBars =
+      SimulationChartDataService.getResourceUsageBars(result);
+    if (resourceBars.length > 0) {
+      const svg = SimulationChartRenderer.renderHorizontalBarChart(
+        resourceBars,
+        {
+          title: "Resource Usage",
+        },
+      );
+      if (svg) {
+        const svgWithId = svg.replace(
+          'class="simulation-chart simulation-chart-bar"',
+          'id="chart-resource-usage" class="simulation-chart simulation-chart-bar"',
+        );
+        sections.push(`
+          <div class="section chart-section">
+            <h3>Resource Usage Chart</h3>
+            ${svgWithId}
+            <div class="chart-actions">
+              <button class="btn btn-sm" onclick="exportChartAsPng('chart-resource-usage')">Export as PNG</button>
+            </div>
+          </div>
+        `);
+      }
+    }
+
+    // Resource proportion doughnut (CPU vs Memory)
+    const proportionSlices =
+      SimulationChartDataService.getResourceProportionDoughnut(result);
+    if (proportionSlices.length > 0) {
+      const svg = SimulationChartRenderer.renderDoughnutChart(
+        proportionSlices,
+        { title: "Execution Time Breakdown" },
+      );
+      if (svg) {
+        const svgWithId = svg.replace(
+          'class="simulation-chart simulation-chart-doughnut"',
+          'id="chart-execution-time" class="simulation-chart simulation-chart-doughnut"',
+        );
+        sections.push(`
+          <div class="section chart-section">
+            <h3>Execution Time Chart</h3>
+            ${svgWithId}
+            <div class="chart-actions">
+              <button class="btn btn-sm" onclick="exportChartAsPng('chart-execution-time')">Export as PNG</button>
+            </div>
+          </div>
+        `);
+      }
+    }
+
+    // State diff summary chart
+    const diffBars = SimulationChartDataService.getStateDiffSummary(result);
+    if (diffBars.length > 0) {
+      const svg = SimulationChartRenderer.renderHorizontalBarChart(diffBars, {
+        title: "State Changes",
+      });
+      if (svg) {
+        const svgWithId = svg.replace(
+          'class="simulation-chart simulation-chart-bar"',
+          'id="chart-state-diff" class="simulation-chart simulation-chart-bar"',
+        );
+        sections.push(`
+          <div class="section chart-section">
+            <h3>State Changes Chart</h3>
+            ${svgWithId}
+            <div class="chart-actions">
+              <button class="btn btn-sm" onclick="exportChartAsPng('chart-state-diff')">Export as PNG</button>
+            </div>
+          </div>
+        `);
+      }
+    }
+
+    if (sections.length === 0) {
+      return "";
+    }
+
+    // Tooltip detail panel for interactive hover info
+    return `
+      <div id="chart-tooltip" style="display:none;position:fixed;padding:6px 10px;background:var(--vscode-editorHoverWidget-background,#252526);border:1px solid var(--vscode-editorHoverWidget-border,#454545);border-radius:4px;font-size:12px;pointer-events:none;z-index:1000;color:var(--vscode-foreground,#ccc)"></div>
+      ${sections.join("\n")}
+    `;
   }
 
   private _getHtmlForResults(
@@ -525,6 +616,22 @@ export class SimulationPanel {
         .btn:hover {
             background-color: var(--vscode-button-hoverBackground);
         }
+        .btn-sm {
+            padding: 3px 8px;
+            font-size: 11px;
+        }
+        .chart-section {
+            margin-top: 8px;
+        }
+        .chart-section svg {
+            display: block;
+            margin: 8px 0;
+            max-width: 100%;
+            height: auto;
+        }
+        .chart-actions {
+            margin-top: 4px;
+        }
         .diff-summary-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
@@ -608,6 +715,8 @@ export class SimulationPanel {
 
     ${stateDiffHtml}
 
+    ${this._getChartsHtml(result)}
+
     <script>
         const vscode = acquireVsCodeApi();
         function exportStateDiff() {
@@ -621,6 +730,25 @@ export class SimulationPanel {
         }
         function exportAsPdf() {
             vscode.postMessage({ command: 'exportAsPdf' });
+        }
+        function exportChartAsPng(chartId) {
+            const svgEl = document.getElementById(chartId);
+            if (!svgEl) { return; }
+            const svgData = new XMLSerializer().serializeToString(svgEl);
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            const img = new Image();
+            img.onload = function() {
+                canvas.width = img.width * 2;
+                canvas.height = img.height * 2;
+                ctx.scale(2, 2);
+                ctx.drawImage(img, 0, 0);
+                const a = document.createElement('a');
+                a.download = chartId + '.png';
+                a.href = canvas.toDataURL('image/png');
+                a.click();
+            };
+            img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svgData)));
         }
     </script>
 </body>
