@@ -11,5 +11,8 @@ ISSUES.md
 .env
 .env.local
 stellar-suite-*.vsix
-out-test/
 
+frontend/node_modules/
+frontend/.env
+frontend/.next
+frontend/package-lock.json
