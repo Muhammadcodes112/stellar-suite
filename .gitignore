@@ -1,9 +1,12 @@
 node_modules/
 out/
+issue-details/
+frontend-issues/
 .vscode-test/
 *.vsix
 .DS_Store
 *.log
+ISSUES.md
 .env
 .env.local
 stellar-suite-*.vsix
